@@ -1,0 +1,81 @@
+menu "Example Configuration"
+
+    config WIFI_CONN_SSID
+        string "Wi-Fi SSID"
+        default "your-ssid"
+        help
+            SSID (network name) to connect to.
+
+    config WIFI_CONN_PASSWORD
+        string "Wi-Fi Password"
+        default "your-password"
+        help
+            Wi-Fi password (WPA or WPA2).
+
+    config WIFI_CONN_MAX_RETRY
+        int "Wi-Fi connection max retry"
+        default 5
+        range 1 20
+        help
+            Max retry times for Wi-Fi connection before reporting failure.
+
+    config WIFI_CONN_FORCE_STA_MAC
+        bool "Force STA MAC to P4 base MAC"
+        default n
+        help
+            If enabled, the STA MAC address is overridden with the P4 base MAC.
+            Leave disabled to let the ESP32-C6 co-processor use its own MAC.
+
+    config EXAMPLE_USED_LDO_CHAN_ID
+        int "example used LDO channel ID"
+        default 3
+        help
+            Example used LDO channel ID, you may check datasheet to know more details.
+
+    config EXAMPLE_USED_LDO_VOLTAGE_MV
+        int "example used LDO voltage in mV"
+        default 2500
+        range 0 3300
+        help
+            Example used LDO voltage, in mV
+
+    config EXAMPLE_CAM_PORT_ISP_MIPI
+        bool
+        default y
+
+    choice EXAMPLE_MIPI_CSI_DISP_HRES
+        bool "Set MIPI CSI horizontal resolution"
+        default EXAMPLE_MIPI_CSI_HRES_1024
+
+        config EXAMPLE_MIPI_CSI_HRES_800
+            bool "800"
+        config EXAMPLE_MIPI_CSI_HRES_1024
+            bool "1024"
+    endchoice
+
+    config EXAMPLE_MIPI_CSI_DISP_HRES
+        int
+        default 800 if EXAMPLE_MIPI_CSI_HRES_800
+        default 1024 if EXAMPLE_MIPI_CSI_HRES_1024
+
+    choice EXAMPLE_MIPI_CSI_DISP_VRES
+        bool "Set MIPI CSI vertical resolution"
+        default EXAMPLE_MIPI_CSI_VRES_600
+
+        config EXAMPLE_MIPI_CSI_VRES_600
+            bool "600"
+        config EXAMPLE_MIPI_CSI_VRES_640
+            bool "640"
+        config EXAMPLE_MIPI_CSI_VRES_800
+            bool "800"
+        config EXAMPLE_MIPI_CSI_VRES_1280
+            bool "1280"
+    endchoice
+
+    config EXAMPLE_MIPI_CSI_DISP_VRES
+        int
+        default 600 if EXAMPLE_MIPI_CSI_VRES_600
+        default 640 if EXAMPLE_MIPI_CSI_VRES_640
+        default 800 if EXAMPLE_MIPI_CSI_VRES_800
+        default 1280 if EXAMPLE_MIPI_CSI_VRES_1280
+endmenu

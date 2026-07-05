@@ -1,0 +1,18 @@
+{
+  "idf.currentSetup": "E:/Tools/ESP-IDF/Espressif/frameworks/esp-idf-v5.5.2/",
+  "idf.openOcdConfigs": [
+    "board/esp32p4-builtin.cfg"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32p4"
+  },
+  "clangd.path": "E:\\Tools\\ESP-IDF\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=e:\\Tools\\ESP-IDF\\Espressif\\frameworks\\esp-idf-v5.5.2\\esp_workspace\\aiot_agent\\build"
+  ],
+  "idf.flashType": "JTAG",
+  "idf.portWin": "COM5",
+  "idf.monitorPort": "COM5"
+}
