@@ -1,0 +1,60 @@
+menu "Audio Configuration"
+
+    config AUDIO_I2S_MCLK_GPIO
+        int "I2S MCLK GPIO"
+        default 13
+        help
+            GPIO number connected to ES8311 MCLK.
+
+    config AUDIO_I2S_BCLK_GPIO
+        int "I2S BCLK GPIO"
+        default 12
+        help
+            GPIO number connected to ES8311 SCLK/BCLK.
+
+    config AUDIO_I2S_WS_GPIO
+        int "I2S WS/LRCK GPIO"
+        default 10
+        help
+            GPIO number connected to ES8311 LRCK/WS.
+
+    config AUDIO_I2S_DOUT_GPIO
+        int "I2S DOUT GPIO (to ES8311 DAC)"
+        default 9
+        help
+            GPIO number connected to ES8311 DSDIN (DAC data input).
+
+    config AUDIO_I2S_DIN_GPIO
+        int "I2S DIN GPIO (from ES8311 ADC)"
+        default 11
+        help
+            GPIO number connected to ES8311 ASDOUT (ADC data output).
+
+    config AUDIO_PA_CTRL_GPIO
+        int "Power amplifier control GPIO"
+        default 53
+        help
+            GPIO number used to enable the speaker amplifier. Set -1 to disable.
+
+    config AUDIO_PLAYBACK_VOLUME
+        int "Default playback volume"
+        range 0 100
+        default 60
+        help
+            Default output volume for ES8311 DAC.
+
+    config AUDIO_MIC_GAIN
+        int "Default microphone gain (dB)"
+        range 0 42
+        default 42
+        help
+            Default input gain for ES8311 ADC.
+
+    config AUDIO_ENABLE_LOOPBACK_TEST
+        bool "Enable audio loopback test task"
+        default n
+        help
+            If enabled, a FreeRTOS task is started that records from the
+            microphone and plays back through the speaker continuously.
+
+endmenu
