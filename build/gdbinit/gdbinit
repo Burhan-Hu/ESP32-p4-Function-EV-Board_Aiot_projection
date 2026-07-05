@@ -1,0 +1,2 @@
+source E:/Tools/ESP-IDF/Espressif/frameworks/esp-idf-v5.5.2/esp_workspace/aiot_agent/build/gdbinit/symbols
+source E:/Tools/ESP-IDF/Espressif/frameworks/esp-idf-v5.5.2/esp_workspace/aiot_agent/build/gdbinit/connect
