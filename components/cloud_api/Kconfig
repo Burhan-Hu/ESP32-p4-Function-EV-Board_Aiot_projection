@@ -1,0 +1,47 @@
+menu "Cloud API Configuration"
+
+    config CLOUD_API_USE_MOCK
+        bool "Use mock cloud API (no network required)"
+        default y
+        help
+            When enabled, ASR/VLM/TTS return fixed responses and a synthetic
+            tone, so the interaction pipeline can be tested without real
+            cloud accounts.
+
+    config CLOUD_API_BAIDU_KEY
+        string "Baidu API Key"
+        default ""
+        help
+            Baidu AI Cloud API Key (from your Baidu application).
+
+    config CLOUD_API_BAIDU_SECRET
+        string "Baidu Secret Key"
+        default ""
+        help
+            Baidu AI Cloud Secret Key (from your Baidu application).
+
+    config CLOUD_API_BAIDU_CUID
+        string "Baidu CUID"
+        default "esp32p4_aiot_agent"
+        help
+            Unique device identifier for Baidu ASR/TTS APIs.
+
+    config CLOUD_API_VOLCANO_KEY
+        string "Volcano Engine API key"
+        default ""
+        help
+            Volcano Engine (Ark) API key for VLM.
+
+    config CLOUD_API_VOLCANO_ENDPOINT
+        string "Volcano Engine endpoint"
+        default "https://ark.cn-beijing.volces.com/api/v3"
+        help
+            Base URL for Volcano Engine Ark API.
+
+    config CLOUD_API_VOLCANO_VLM_MODEL
+        string "Volcano VLM model"
+        default "doubao-vision-lite-32k"
+        help
+            Model name for visual question answering, e.g. doubao-vision-lite-32k.
+
+endmenu

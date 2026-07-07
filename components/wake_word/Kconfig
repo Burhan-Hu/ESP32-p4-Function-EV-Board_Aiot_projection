@@ -1,0 +1,17 @@
+menu "Wake Word Configuration"
+
+    config WAKE_WORD_ENABLED
+        bool "Enable WakeNet wake word detection task"
+        default y
+        help
+            Start the WakeNet wake word detection task after audio initialization.
+            The detected wake word can be selected in the ESP Speech Recognition
+            menu (provided by esp-sr component).
+
+    config WAKE_WORD_TASK_STACK_SIZE
+        int "Wake word task stack size"
+        default 8192
+        help
+            Stack size for the wake word detection task.
+
+endmenu

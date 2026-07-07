@@ -1,305 +1,452 @@
 # ESP32-P4 AIoT 项目团队分工方案
 
-## 一、团队约束
+## 一、项目目标
 
-- 团队共 **3 人**
-- 仅有 **1 人（A）** 能经常接触开发板
-- 另外 **2 人（B、C）** 主要负责不依赖硬件的算法、云端、逻辑开发
-- 所有代码通过 Git 协作，由 A 定期集成到主工程并在板子上验证
+基于 ESP32-P4-Function-EV-Board，构建一个多模态 AIoT 智能体终端，实现：
 
----
-
-## 二、角色与职责
-
-### A：硬件负责人 / 集成测试负责人
-
-**唯一接触开发板的人员。**
-
-主要职责：
-- 负责开发板上的所有驱动调试、固件烧录、现场测试
-- 每周将 B、C 提交的模块代码集成到主工程
-- 记录并反馈板子上的运行日志、截图、视频给 B、C
-- 负责最终联调、演示准备、现场问题排查
-
-**原则：** A 的时间应优先用于硬件相关工作和集成，尽量不承担纯业务逻辑开发。
+- **视觉问答**：语音唤醒 → 拍照 → 云端 VLM 回答 → 屏幕显示 + 语音播报
+- **环境监控**：PIR 检测环境变化 → 关键帧截取 → 事件记录/提醒
+- **人走灯灭**：ESP-WHO 本地人体检测 → LED 自动开关
+- **状态与展示**：全局状态机 + 屏幕 UI 状态显示
 
 ---
 
-### B：云端 AI 接口负责人
+## 二、团队角色与任务划分
 
-**不依赖开发板，全部工作可在 PC 上完成。**
-
-主要职责：
-- 负责 VLM（视觉问答）云端 API 对接
-- 负责 ASR（语音识别）云端 API 对接
-- 负责 TTS（语音合成）云端 API 对接
-- 设计云端请求的错误处理、超时重试、JSON 解析、内存管理
-- 先在 PC 上用 Python/curl 调通接口，再封装为 C 模块
+团队按功能模块划分为 **4 个角色**，每个角色有明确交付物和接口边界。
 
 ---
 
-### C：本地算法与状态机负责人
+### 角色 1：人机交互主链路
 
-**大部分工作可在 PC 上完成，少数情况需要 A 在板子上验证。**
+**核心任务：** 实现从语音唤醒到云端回答再到语音/屏幕输出的完整交互链路。
 
-主要职责：
-- 关键帧筛选算法（拉普拉斯清晰度 + 帧差）
-- 系统状态机设计（IDLE / MONITORING / TRIGGERED / CONFIRMING / ACTION）
-- PIR + LED 联动逻辑
-- 事件日志 JSON 格式设计与存储
-- 屏幕 UI / LVGL 布局设计
+具体工作：
+- 集成 ESP-SR 语音唤醒模型，管理唤醒词触发
+- 集成 ASR 语音识别，将用户语音转为文本指令
+- 解析指令类型：摄像头问答 / 环境监控任务
+- 实现关键帧提取与缓存（清晰度 + 帧差）
+- 对接云端 VLM / ASR / TTS API
+- 管理 PIR 中断，实现环境变化监控模式
+- 触发屏幕 UI 更新和扬声器语音播报
+
+交付物：
+- `components/hci/hci_engine.h`：人机交互引擎接口
+- `components/keyframe/keyframe.h`：关键帧提取与缓存
+- `components/cloud_api/cloud_api.h`：云端 API 封装
+- `components/monitor/env_monitor.h`：PIR 环境监控接口
 
 ---
 
-## 三、模块接口约定
+### 角色 2：ESP-WHO 人体检测与物联网执行
 
-三人必须按以下接口开发，A 集成时直接调用。
+**核心任务：** 基于 ESP-WHO 实现本地人体检测，并控制 LED 实现人走灯灭。
 
-### 3.1 云端 AI 接口（B 提供）
+具体工作：
+- 集成 ESP-WHO 人体检测模型
+- 从摄像头视频流持续推理，维护"是否有人"状态
+- 设计人员存在/离开的判断策略（超时时间、置信度阈值）
+- 控制 LED 灯带实现"开灯/关灯"模拟
+- 向状态机提供人员存在状态查询接口
 
-文件：`components/cloud_api/cloud_api.h`
+交付物：
+- `components/human_detect/human_detect.h`：人体检测接口
+- `components/led_controller/led_controller.h`：LED 控制接口
+- 人走灯灭逻辑实现
+
+---
+
+### 角色 3：系统状态机
+
+**核心任务：** 设计并实现全局状态机，管理各模式之间的切换与互斥。
+
+具体工作：
+- 定义系统运行状态：IDLE、LISTENING、CAPTURING、ASKING、SPEAKING、MONITORING、ALERT 等
+- 设计状态转换条件和事件触发机制
+- 协调人机交互链路、环境监控、人走灯灭三条独立运行线程
+- 提供状态查询和状态切换接口给 UI 和其他模块
+- 处理异常状态和错误降级
+
+交付物：
+- `components/state_machine/state_machine.h`：状态机接口
+- 状态转换图和状态说明文档
+
+---
+
+### 角色 4：UI 设计与展示
+
+**核心任务：** 设计并实现屏幕 UI，展示系统状态、答案文本和关键帧图像。
+
+具体工作：
+- 基于 LVGL v9 设计 UI 页面和控件布局
+- 设计不同系统状态对应的 UI 样式（空闲、监听中、思考中、播报中、监控中、提醒）
+- 实现答案文本显示、关键帧缩略图显示、状态图标显示
+- 与状态机联动，根据状态自动切换 UI
+- 设计演示场景的 UI 流程
+
+交付物：
+- `components/ui/ui_manager.h`：UI 管理接口
+- UI 设计稿或布局说明
+- 各状态对应的 UI 效果图
+
+---
+
+## 三、PIR 功能定位说明
+
+在本项目中，PIR 不再用于"人走灯灭"。人走灯灭功能由 **ESP-WHO 人体检测** 实现。
+
+PIR 的新定位是：**环境变化监控传感器**。
+
+### PIR 触发场景
+
+```text
+用户开启监控模式
+    ↓
+PIR 检测到红外热源运动（如有人进入画面区域）
+    ↓
+触发关键帧截取
+    ↓
+保存事件到缓冲区 / 上报 / 屏幕提示
+```
+
+### PIR 与关键帧的关系
+
+| 触发源 | 作用 |
+|--------|------|
+| PIR | 快速检测运动事件，唤醒系统截取关键帧 |
+| 关键帧提取 | 保存事件发生前后的清晰画面，用于后续查看或 VLM 分析 |
+
+### 注意
+
+PIR 对"热源运动"敏感，对"普通物体被移动"（如书本、椅子）不够敏感。如果需求是检测任意画面变化，应额外使用**帧差算法**作为补充。
+
+---
+
+## 四、模块接口约定
+
+四个角色的代码通过以下 C 接口交互。
+
+### 4.1 人机交互引擎接口（角色 1 提供）
 
 ```c
+/* hci_engine.h */
 #pragma once
 #include "esp_err.h"
-#include <stdint.h>
-#include <stddef.h>
 
-typedef struct {
-    char *text;   /* 云端返回的文本，调用者需释放 */
-    int len;
-} cloud_response_t;
+/* 初始化人机交互引擎 */
+esp_err_t hci_engine_init(void);
 
-/* VLM 视觉问答：传入问题 + JPEG 图像，返回文本答案 */
-esp_err_t cloud_vlm_ask(const char *question,
-                        const uint8_t *jpeg_data,
-                        size_t jpeg_len,
-                        cloud_response_t *out);
+/* 启动语音唤醒监听 */
+esp_err_t hci_start_listening(void);
 
-/* ASR 语音识别：传入 PCM 音频数据，返回识别文本 */
-esp_err_t cloud_asr_transcribe(const int16_t *pcm_data,
-                               int pcm_samples,
-                               cloud_response_t *out);
+/* 进入环境监控模式 */
+esp_err_t hci_start_monitoring(void);
 
-/* TTS 语音合成：传入文本，返回 PCM 音频数据 */
-esp_err_t cloud_tts_speak(const char *text,
-                          uint8_t **pcm_out,
-                          size_t *pcm_len);
-
-/* 释放 cloud_response_t 内部内存 */
-void cloud_response_free(cloud_response_t *resp);
+/* 退出环境监控模式 */
+esp_err_t hci_stop_monitoring(void);
 ```
 
 ---
 
-### 3.2 智能家居状态机接口（C 提供）
-
-文件：`components/smart_home/smart_home.h`
+### 4.2 关键帧接口（角色 1 提供）
 
 ```c
-#pragma once
-#include <stdbool.h>
-
-/* 系统运行状态 */
-typedef enum {
-    STATE_IDLE,
-    STATE_MONITORING,
-    STATE_TRIGGERED,
-    STATE_CONFIRMING,
-    STATE_ACTION
-} system_state_t;
-
-/* PIR 检测到人体运动时由 A 调用 */
-void on_pir_motion_detected(void);
-
-/* 画面变化分数超过阈值时由 A 调用 */
-void on_frame_change_detected(float score);
-
-/* 获取当前 LED 状态，A 用于 UI 显示 */
-bool led_is_on(void);
-
-/* 状态机主循环，A 在 main loop 中周期性调用 */
-void state_machine_tick(void);
-```
-
----
-
-### 3.3 关键帧筛选接口（C 提供）
-
-文件：`components/keyframe/keyframe.h`
-
-```c
+/* keyframe.h */
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
-#include <stdint.h>
 
 typedef struct {
     uint8_t *jpeg_buf;
     size_t jpeg_len;
     int64_t timestamp_ms;
     float clarity_score;
+    float motion_score;
 } keyframe_t;
 
-/* 每收到一帧图像时由 A 调用 */
+/* 每收到一帧图像时调用 */
 void keyframe_feed(const uint8_t *rgb565, int w, int h);
 
-/* 用户唤醒或询问时，获取当前最佳关键帧 */
+/* 获取当前最佳关键帧 */
 const keyframe_t *keyframe_get_best(void);
 
-/* 事件触发时保存前中后关键帧组 */
+/* 事件触发时保存前中后帧 */
 void keyframe_save_event_group(void);
 ```
 
 ---
 
-## 四、无硬件开发方法
-
-### 4.1 B 的云端开发流程
-
-1. 在 PC 上注册百度飞桨星河社区账号，获取 API Token
-2. 用 Python 脚本调通 VLM / ASR / TTS 接口
-3. 将 Python 逻辑改写为 C 代码
-4. A 将 `cloud_api.c` 集成到 ESP32 工程
-
-B 需要 A 配合提供：
-- 开发板拍摄的一张真实 JPEG 图片（确认压缩后大小）
-- 板子联网后 HTTP 请求的日志（确认能成功发送请求）
-
----
-
-### 4.2 C 的本地逻辑开发流程
-
-1. 在 PC 上用 OpenCV 或纯 C 实现关键帧筛选算法
-2. 用模拟输入测试状态机跳转
-3. 用静态图片或视频文件验证关键帧选择效果
-4. A 将代码集成到板子后，替换模拟输入为真实 GPIO / 摄像头事件
-
-示例 PC 模拟程序：
+### 4.3 云端 AI 接口（角色 1 提供）
 
 ```c
-/* 用于在 PC 上验证状态机 */
-int main(void) {
-    on_pir_motion_detected();
-    on_frame_change_detected(85.0f);
+/* cloud_api.h */
+#pragma once
+#include "esp_err.h"
+#include <stdint.h>
+#include <stddef.h>
 
-    for (int i = 0; i < 100; i++) {
-        state_machine_tick();
-        usleep(100000);
-    }
-    return 0;
-}
+typedef struct {
+    char *text;   /* 调用者需调用 cloud_response_free 释放 */
+    int len;
+} cloud_response_t;
+
+/* VLM 视觉问答 */
+esp_err_t cloud_vlm_ask(const char *question,
+                        const uint8_t *jpeg_data,
+                        size_t jpeg_len,
+                        cloud_response_t *out);
+
+/* ASR 语音识别 */
+esp_err_t cloud_asr_transcribe(const int16_t *pcm_data,
+                               int pcm_samples,
+                               cloud_response_t *out);
+
+/* TTS 语音合成 */
+esp_err_t cloud_tts_speak(const char *text,
+                          uint8_t **pcm_out,
+                          size_t *pcm_len);
+
+void cloud_response_free(cloud_response_t *resp);
 ```
 
 ---
 
-## 五、Git 分支策略
+### 4.4 人体检测接口（角色 2 提供）
+
+```c
+/* human_detect.h */
+#pragma once
+#include <stdbool.h>
+
+/* 初始化 ESP-WHO 人体检测 */
+int human_detect_init(void);
+
+/* 启动人体检测 */
+int human_detect_start(void);
+
+/* 当前是否检测到人体 */
+bool human_is_present(void);
+
+/* 设置人离开超时时间（毫秒） */
+void human_set_leave_timeout(uint32_t ms);
+
+/* 人员离开回调（角色 2 内部使用，也可通知状态机） */
+typedef void (*human_left_callback_t)(uint32_t duration_ms);
+void human_register_left_callback(human_left_callback_t cb);
+```
+
+---
+
+### 4.5 LED 控制接口（角色 2 提供）
+
+```c
+/* led_controller.h */
+#pragma once
+
+/* 初始化 LED PWM */
+int led_controller_init(void);
+
+/* 开灯 */
+void led_turn_on(void);
+
+/* 关灯 */
+void led_turn_off(void);
+
+/* 设置亮度 0~100 */
+void led_set_brightness(int percent);
+
+/* 查询当前状态 */
+bool led_is_on(void);
+```
+
+---
+
+### 4.6 系统状态机接口（角色 3 提供）
+
+```c
+/* state_machine.h */
+#pragma once
+
+typedef enum {
+    STATE_IDLE,
+    STATE_LISTENING,
+    STATE_CAPTURING,
+    STATE_ASKING,
+    STATE_SPEAKING,
+    STATE_MONITORING,
+    STATE_ALERT
+} system_state_t;
+
+/* 初始化状态机 */
+void state_machine_init(void);
+
+/* 主循环调用 */
+void state_machine_tick(void);
+
+/* 切换到指定状态 */
+void state_transition_to(system_state_t new_state);
+
+/* 获取当前状态 */
+system_state_t state_get_current(void);
+```
+
+---
+
+### 4.7 UI 管理接口（角色 4 提供）
+
+```c
+/* ui_manager.h */
+#pragma once
+#include <stdint.h>
+#include <stddef.h>
+
+typedef enum {
+    UI_STATE_IDLE,
+    UI_STATE_LISTENING,
+    UI_STATE_THINKING,
+    UI_STATE_SPEAKING,
+    UI_STATE_MONITORING,
+    UI_STATE_ALERT
+} ui_state_t;
+
+/* 初始化 UI */
+void ui_init(void);
+
+/* 设置 UI 状态 */
+void ui_set_state(ui_state_t state);
+
+/* 显示答案文本 */
+void ui_show_answer(const char *text);
+
+/* 显示关键帧缩略图 */
+void ui_show_keyframe(const uint8_t *jpeg, size_t len);
+
+/* 显示状态提示 */
+void ui_show_status(const char *status);
+```
+
+---
+
+## 五、开发流程与协作规范
+
+### 5.1 并行开发原则
+
+- 角色 1 先完成音频通路和云端 API 的 PC 端验证
+- 角色 2 先完成 ESP-WHO 模型集成和 LED 驱动
+- 角色 3 和角色 4 紧密协作，先定义状态和 UI 的对应关系
+- 各模块通过接口 stub 在 PC 上独立验证逻辑
+
+### 5.2 Git 分支策略
 
 ```
-main/              # A 维护，仅在板子验证通过的代码
-feature/cloud/     # B 开发云端 API
-feature/keyframe/  # C 开发关键帧筛选
-feature/state/     # C 开发状态机与联动逻辑
-feature/ui/        # C 或 A 开发屏幕 UI
+main/              # 仅在板子验证通过的代码
+feature/hci/       # 人机交互主链路
+feature/keyframe/  # 关键帧提取
+feature/cloud/     # 云端 API
+feature/human_detect/  # ESP-WHO 人体检测
+feature/led/       # LED 控制
+feature/state/     # 状态机
+feature/ui/        # 屏幕 UI
 ```
 
-**合并节奏：**
-- B、C 每周至少向对应 feature 分支推送一次代码
-- A 每周固定时间合并 feature 分支到 main，并在板子上测试
-- 测试不通过时，A 在 issue/群聊中反馈日志，由 B/C 修复后重新提交
+### 5.3 集成节奏
+
+- 每周固定时间合并 feature 分支到 main
+- 每次合并后在开发板上完整测试一遍
+- 测试结果以日志和视频形式记录
+- 发现问题后回退到对应 feature 分支修复
+
+### 5.4 接口变更流程
+
+任何接口变更必须经过相关角色共同确认，避免单方面修改导致集成失败。
 
 ---
 
 ## 六、项目阶段与里程碑
 
-### 阶段 1：云端 AI 主链路（优先级最高）
+### 阶段 1：基础能力验证
 
-**目标：** 实现"触发 → 拍照 → VLM → TTS → 播报"核心链路。
+**目标：** 摄像头、麦克风、扬声器、Wi-Fi、屏幕全部可用。
 
-| 负责人 | 任务 |
-|--------|------|
-| B | 百度飞桨 VLM / TTS API 调通并封装为 C 模块 |
-| A | 在板子上集成 cloud_api，用串口命令触发拍照问答 |
-| C | 准备屏幕 UI 状态显示框架 |
+| 角色 | 任务 |
+|------|------|
+| 角色 1 | 验证音频录音/播放、准备云端 API 账号 |
+| 角色 2 | 确认 LED 驱动和摄像头帧访问方式 |
+| 角色 3 | 设计全局状态定义 |
+| 角色 4 | 设计 UI 页面框架 |
 
-**验收标准：** 对着摄像头提问，系统能语音回答。
-
----
-
-### 阶段 2：语音交互闭环
-
-**目标：** 用语音替代手动触发。
-
-| 负责人 | 任务 |
-|--------|------|
-| A | 集成 ESP-SR WakeNet，烧录唤醒词模型 |
-| B | ASR 录音转文字接口封装 |
-| C | 设计唤醒后交互状态机 |
-
-**验收标准：** 说"小智小智，这是什么"，系统自动拍照并回答。
+**验收标准：** 板子能拍照、录音、联网、显示、控制 LED。
 
 ---
 
-### 阶段 3：本地智能增强
+### 阶段 2：人机交互主链路
 
-**目标：** 减少云端调用，增加事件记忆。
+**目标：** 实现"语音唤醒 → 拍照 → VLM → TTS → 播报 + 显示"。
 
-| 负责人 | 任务 |
-|--------|------|
-| C | 关键帧筛选算法 + 事件关键帧组保存 |
-| A | 在板子上验证 PSRAM 缓冲区和实时性 |
-| B | 配合设计 VLM 提问策略（如"刚才发生什么"） |
+| 角色 | 任务 |
+|------|------|
+| 角色 1 | 完成唤醒、ASR、关键帧、VLM、TTS 链路 |
+| 角色 3 | 定义 ASKING/SPEAKING 等状态 |
+| 角色 4 | 实现答案显示和状态切换 UI |
+| 角色 2 | 确保摄像头帧可被角色 1 稳定获取 |
 
-**验收标准：** 画面变化时主动提醒，能回答"刚才发生什么"。
+**验收标准：** 说唤醒词 + 问题，系统自动拍照并在屏幕和扬声器返回答案。
 
 ---
 
-### 阶段 4：物联网执行闭环
+### 阶段 3：环境监控功能
 
-**目标：** 实现人走灯灭等物理联动。
+**目标：** PIR 触发 → 关键帧截取 → 事件记录/提醒。
 
-| 负责人 | 任务 |
-|--------|------|
-| A | PIR GPIO 中断 + LED PWM 驱动 |
-| C | 状态机与 PIR/LED 联动逻辑 |
-| B | 配合设计语音确认对话流程 |
+| 角色 | 任务 |
+|------|------|
+| 角色 1 | 实现 PIR 中断 + 关键帧事件保存 |
+| 角色 3 | 定义 MONITORING/ALERT 状态 |
+| 角色 4 | 实现监控模式 UI 和事件提醒 UI |
+| 角色 2 | 配合确认摄像头帧共享无冲突 |
 
-**验收标准：** 人离开后 LED 自动熄灭，或语音命令控制 LED。
+**验收标准：** 开启监控模式后，有人进入区域时屏幕提示并保存关键帧。
+
+---
+
+### 阶段 4：人走灯灭联动
+
+**目标：** ESP-WHO 检测人体 → 人离开后 LED 自动熄灭。
+
+| 角色 | 任务 |
+|------|------|
+| 角色 2 | 集成 ESP-WHO，实现人体检测和 LED 控制 |
+| 角色 3 | 将人体存在状态纳入系统状态 |
+| 角色 4 | 在 UI 上显示人员存在状态 |
+| 角色 1 | 确保不与人机交互链路抢摄像头资源 |
+
+**验收标准：** 人离开后若干秒，LED 自动熄灭；人来了自动亮起。
+
+---
+
+### 阶段 5：联调与演示准备
+
+**目标：** 四个演示场景全部跑通，文档视频齐全。
+
+| 角色 | 任务 |
+|------|------|
+| 角色 1 | 确保问答和监控链路稳定 |
+| 角色 2 | 确保人走灯灭稳定 |
+| 角色 3 | 完善状态转换和异常处理 |
+| 角色 4 | 完善 UI、编写演示脚本、录制演示视频 |
 
 ---
 
 ## 七、外设采购清单
 
-| 外设 | 型号/规格 | 数量 | 负责人 | 用途 |
-|------|----------|------|--------|------|
-| 无源喇叭 | 4Ω 3W，带腔体 | 1 | A | TTS 语音播报 |
-| PIR 传感器 | AM312 或 HC-SR501 | 1 | A | 人体运动检测 |
-| LED 灯带/灯珠 | WS2812B 或白光 LED + 驱动 | 1 | A | 模拟灯光开关 |
-
-**说明：** 不采购光照传感器，改用 PIR + 视频检测算法共同实现人走灯灭。
+| 外设 | 规格 | 数量 | 负责角色 | 用途 |
+|------|------|------|---------|------|
+| 无源喇叭 | 4Ω 3W，带腔体 | 1 | 角色 1 | TTS 语音播报 |
+| PIR 传感器 | AM312 或 HC-SR501 | 1 | 角色 1 | 环境变化监控 |
+| LED 灯带/灯珠 | WS2812B 或白光 LED + 驱动 | 1 | 角色 2 | 模拟灯光开关 |
 
 ---
 
-## 八、沟通与协作规范
+## 八、文档维护
 
-1. **每周固定时间线上同步：** 汇报进度、对齐接口、解决阻塞
-2. **A 每次烧录后必须保存完整日志：** 便于 B/C 远程分析
-3. **B/C 提交代码前必须在 PC 上编译/测试通过：** 减少 A 的集成返工
-4. **接口变更必须三方确认：** 避免单方面修改导致集成失败
-5. **使用 GitHub Issues 或群聊记录问题：** 每个问题明确负责人和截止时间
-
----
-
-## 九、立即执行项
-
-| 负责人 | 任务 | 截止时间 |
-|--------|------|---------|
-| A | 关闭音频 loopback 测试，保持板子基础环境干净 | 本周 |
-| B | 注册百度飞桨账号，用 Python 调通 VLM 拍照问答 | 本周 |
-| C | 在 PC 上用 OpenCV 实现关键帧筛选原型 | 本周 |
-
----
-
-## 十、文档维护
-
-本文件为活文档，随着项目进展和分工调整应及时更新。任何接口变更、角色调整、里程碑变动都应同步修改本文件。
+本文件为活文档。随着项目进展，接口变更、阶段调整、里程碑更新都应及时同步到本文档中。建议每次里程碑评审后更新一次。
