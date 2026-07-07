@@ -26,6 +26,59 @@ extern "C" {
 esp_err_t audio_init(i2c_master_bus_handle_t i2c_bus_handle);
 
 /**
+ * @brief Get the codec device handle.
+ *
+ * This handle can be used by other components (e.g. wake word engine) that
+ * need to read audio samples directly from the codec.
+ *
+ * @return Codec device handle, or NULL if audio_init() has not been called.
+ */
+void *audio_get_codec_handle(void);
+
+/**
+ * @brief Record mono 16-bit 16 kHz PCM audio from the microphone.
+ *
+ * The function allocates a DMA-capable buffer internally, reads stereo data
+ * from the codec, and returns a mono buffer. The caller must release the
+ * returned buffer with audio_free_pcm().
+ *
+ * @param duration_ms   Recording duration in milliseconds.
+ * @param pcm_out       Output pointer to the mono PCM buffer.
+ * @param sample_count  Output number of mono 16-bit samples.
+ * @return ESP_OK on success, otherwise an error code.
+ */
+esp_err_t audio_record(int duration_ms, int16_t **pcm_out, size_t *sample_count);
+
+/**
+ * @brief Play mono 16-bit 16 kHz PCM audio through the speaker.
+ *
+ * The input mono samples are duplicated to stereo internally before being
+ * sent to the codec.
+ *
+ * @param pcm           Pointer to mono PCM samples.
+ * @param sample_count  Number of mono 16-bit samples.
+ * @return ESP_OK on success, otherwise an error code.
+ */
+esp_err_t audio_play_pcm(const int16_t *pcm, size_t sample_count);
+
+/**
+ * @brief Free a PCM buffer returned by audio_record().
+ *
+ * @param pcm Buffer returned from audio_record(), may be NULL.
+ */
+void audio_free_pcm(int16_t *pcm);
+
+/**
+ * @brief Run an audio record-only test.
+ *
+ * Records audio from the on-board microphone for a fixed duration and prints
+ * the peak amplitude. Useful when no speaker is connected yet.
+ *
+ * @param arg FreeRTOS task argument (unused).
+ */
+void audio_record_test(void *arg);
+
+/**
  * @brief Run a short audio loopback test.
  *
  * Records audio from the on-board microphone and plays it back through the

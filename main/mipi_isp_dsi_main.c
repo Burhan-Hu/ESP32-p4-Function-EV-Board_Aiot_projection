@@ -26,12 +26,68 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "audio.h"
+#include "cloud_api.h"
+#if CONFIG_WAKE_WORD_ENABLED
+#include "wake_word.h"
+#endif
 
 static const char *TAG = "mipi_isp_dsi";
 
 static bool s_camera_get_new_vb(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data);
 static bool s_camera_get_finished_trans(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data);
 static void http_test_request(void);
+
+#if CONFIG_WAKE_WORD_ENABLED
+static void on_wake_word_detected(void)
+{
+    ESP_LOGI(TAG, "wake word detected callback");
+
+    /* Record 3 seconds of audio after wake word. */
+    int16_t *rec_pcm = NULL;
+    size_t rec_samples = 0;
+    esp_err_t ret = audio_record(3000, &rec_pcm, &rec_samples);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "audio record failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "recorded %zu samples for ASR", rec_samples);
+
+    /* ASR: speech to text. */
+    cloud_response_t asr_result = {0};
+    ret = cloud_asr_transcribe(rec_pcm, rec_samples, &asr_result);
+    audio_free_pcm(rec_pcm);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ASR failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "ASR result: %s", asr_result.text);
+
+    /* VLM: image question answering (mock uses NULL image for now). */
+    cloud_response_t vlm_result = {0};
+    ret = cloud_vlm_ask(asr_result.text, NULL, 0, &vlm_result);
+    cloud_response_free(&asr_result);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "VLM failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "VLM result: %s", vlm_result.text);
+
+    /* TTS: text to speech and play. */
+    int16_t *tts_pcm = NULL;
+    size_t tts_samples = 0;
+    ret = cloud_tts_speak(vlm_result.text, &tts_pcm, &tts_samples);
+    cloud_response_free(&vlm_result);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "TTS failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "TTS generated %zu samples, playing...", tts_samples);
+    audio_play_pcm(tts_pcm, tts_samples);
+    cloud_pcm_free(tts_pcm);
+
+    ESP_LOGI(TAG, "interaction pipeline done");
+}
+#endif
 
 void app_main(void)
 {
@@ -102,6 +158,18 @@ void app_main(void)
 #if CONFIG_AUDIO_ENABLE_LOOPBACK_TEST
         ESP_LOGI(TAG, "starting audio loopback test task");
         xTaskCreate(audio_loopback_test, "audio_loopback", 8192, NULL, 5, NULL);
+#elif CONFIG_WAKE_WORD_ENABLED
+        ESP_LOGI(TAG, "initializing wake word engine");
+        ret = wake_word_init();
+        if (ret == ESP_OK) {
+            wake_word_register_callback(on_wake_word_detected);
+            wake_word_start();
+        } else {
+            ESP_LOGE(TAG, "wake word init failed");
+        }
+#elif CONFIG_AUDIO_ENABLE_RECORD_TEST
+        ESP_LOGI(TAG, "starting audio record test task");
+        xTaskCreate(audio_record_test, "audio_record_test", 8192, NULL, 5, NULL);
 #endif
     }
 

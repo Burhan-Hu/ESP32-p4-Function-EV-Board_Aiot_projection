@@ -57,4 +57,13 @@ menu "Audio Configuration"
             If enabled, a FreeRTOS task is started that records from the
             microphone and plays back through the speaker continuously.
 
+    config AUDIO_ENABLE_RECORD_TEST
+        bool "Enable audio record-only test task"
+        default n
+        depends on !AUDIO_ENABLE_LOOPBACK_TEST && !WAKE_WORD_ENABLED
+        help
+            If enabled, a FreeRTOS task records 3 seconds of audio from the
+            microphone and prints the peak amplitude. Useful when no speaker
+            is connected yet. Mutually exclusive with wake word detection.
+
 endmenu

@@ -149,6 +149,99 @@ esp_err_t audio_init(i2c_master_bus_handle_t i2c_bus_handle)
     return ESP_OK;
 }
 
+void *audio_get_codec_handle(void)
+{
+    return (void *)s_codec_handle;
+}
+
+esp_err_t audio_record(int duration_ms, int16_t **pcm_out, size_t *sample_count)
+{
+    if (s_codec_handle == NULL || pcm_out == NULL || sample_count == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (duration_ms <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const size_t mono_samples = (size_t)((AUDIO_SAMPLE_RATE * duration_ms) / 1000);
+    const size_t stereo_samples = mono_samples * AUDIO_CHANNELS;
+    const size_t stereo_bytes = stereo_samples * sizeof(int16_t);
+
+    int16_t *stereo_buf = (int16_t *)heap_caps_malloc(stereo_bytes,
+                                                       MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (stereo_buf == NULL) {
+        ESP_LOGE(TAG, "failed to allocate stereo record buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    int ret = esp_codec_dev_read(s_codec_handle, stereo_buf, (int)stereo_bytes);
+    if (ret != ESP_CODEC_DEV_OK) {
+        ESP_LOGE(TAG, "codec read failed: %d", ret);
+        heap_caps_free(stereo_buf);
+        return ESP_FAIL;
+    }
+
+    int16_t *mono_buf = (int16_t *)heap_caps_malloc(mono_samples * sizeof(int16_t),
+                                                    MALLOC_CAP_INTERNAL);
+    if (mono_buf == NULL) {
+        ESP_LOGE(TAG, "failed to allocate mono record buffer");
+        heap_caps_free(stereo_buf);
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Extract left channel from interleaved stereo data. */
+    for (size_t i = 0; i < mono_samples; i++) {
+        mono_buf[i] = stereo_buf[i * AUDIO_CHANNELS];
+    }
+
+    heap_caps_free(stereo_buf);
+    *pcm_out = mono_buf;
+    *sample_count = mono_samples;
+    ESP_LOGI(TAG, "recorded %zu mono samples (%d ms)", mono_samples, duration_ms);
+    return ESP_OK;
+}
+
+esp_err_t audio_play_pcm(const int16_t *pcm, size_t sample_count)
+{
+    if (s_codec_handle == NULL || pcm == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (sample_count == 0) {
+        return ESP_OK;
+    }
+
+    const size_t stereo_samples = sample_count * AUDIO_CHANNELS;
+    const size_t stereo_bytes = stereo_samples * sizeof(int16_t);
+
+    int16_t *stereo_buf = (int16_t *)heap_caps_malloc(stereo_bytes,
+                                                       MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (stereo_buf == NULL) {
+        ESP_LOGE(TAG, "failed to allocate playback buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Duplicate mono samples to both channels. */
+    for (size_t i = 0; i < sample_count; i++) {
+        stereo_buf[i * AUDIO_CHANNELS]     = pcm[i];
+        stereo_buf[i * AUDIO_CHANNELS + 1] = pcm[i];
+    }
+
+    int ret = esp_codec_dev_write(s_codec_handle, stereo_buf, (int)stereo_bytes);
+    heap_caps_free(stereo_buf);
+    if (ret != ESP_CODEC_DEV_OK) {
+        ESP_LOGE(TAG, "codec write failed: %d", ret);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+void audio_free_pcm(int16_t *pcm)
+{
+    if (pcm != NULL) {
+        heap_caps_free(pcm);
+    }
+}
+
 static int32_t find_peak(const int16_t *samples, size_t count)
 {
     int32_t peak = 0;
@@ -162,6 +255,30 @@ static int32_t find_peak(const int16_t *samples, size_t count)
         }
     }
     return peak;
+}
+
+void audio_record_test(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Audio record test started (record 3s -> print peak)");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    while (true) {
+        int16_t *pcm = NULL;
+        size_t samples = 0;
+        esp_err_t ret = audio_record(3000, &pcm, &samples);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "record failed: %s", esp_err_to_name(ret));
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        int32_t peak = find_peak(pcm, samples);
+        ESP_LOGI(TAG, "record test: %zu mono samples, peak=%ld (max=%d)",
+                 samples, peak, (int)INT16_MAX);
+        audio_free_pcm(pcm);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }
 
 void audio_loopback_test(void *arg)
