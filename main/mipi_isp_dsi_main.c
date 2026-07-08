@@ -10,10 +10,12 @@
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_ldo_regulator.h"
 #include "esp_cache.h"
+#include "esp_heap_caps.h"
 #include "driver/i2c_master.h"
 #include "driver/isp.h"
 #include "esp_cam_ctlr_csi.h"
@@ -27,15 +29,184 @@
 #include "esp_crt_bundle.h"
 #include "audio.h"
 #include "cloud_api.h"
+#include "pir.h"
+#include "camera_capture.h"
 #if CONFIG_WAKE_WORD_ENABLED
 #include "wake_word.h"
 #endif
 
 static const char *TAG = "mipi_isp_dsi";
 
+static esp_cam_ctlr_handle_t s_cam_handle = NULL;
+static int s_cam_width = 0;
+static int s_cam_height = 0;
+static void *s_frame_buffer = NULL;
+static size_t s_frame_buffer_size = 0;
+static SemaphoreHandle_t s_cam_capture_mutex = NULL;
+
+/* -------------------------------------------------------------------------- */
+/* Continuous monitoring state machine                                        */
+/* -------------------------------------------------------------------------- */
+
+typedef enum {
+    MONITOR_STATE_IDLE,
+    MONITOR_STATE_ACTIVE,
+} monitor_state_t;
+
+#define MONITOR_DEFAULT_DURATION_MS (5 * 60 * 1000)
+#define MONITOR_PIR_COOLDOWN_MS     5000
+
+static monitor_state_t s_monitor_state = MONITOR_STATE_IDLE;
+static uint32_t s_monitor_deadline_ms = 0;
+static uint32_t s_monitor_last_pir_ms = 0;
+static uint8_t *s_monitor_ref_jpeg = NULL;
+static size_t s_monitor_ref_jpeg_len = 0;
+static SemaphoreHandle_t s_monitor_mutex = NULL;
+
+static void monitor_init(void)
+{
+    if (s_monitor_mutex == NULL) {
+        s_monitor_mutex = xSemaphoreCreateMutex();
+    }
+}
+
+static bool monitor_is_command(const char *text, bool *start_out)
+{
+    if (text == NULL || start_out == NULL) {
+        return false;
+    }
+    if (strstr(text, "开始监测") || strstr(text, "帮我看着") ||
+        strstr(text, "监控一下") || strstr(text, "开始监控")) {
+        *start_out = true;
+        return true;
+    }
+    if (strstr(text, "停止监测") || strstr(text, "结束监测") ||
+        strstr(text, "停止监控") || strstr(text, "结束监控")) {
+        *start_out = false;
+        return true;
+    }
+    return false;
+}
+
+static void monitor_clear_reference(void)
+{
+    if (s_monitor_ref_jpeg != NULL) {
+        heap_caps_free(s_monitor_ref_jpeg);
+        s_monitor_ref_jpeg = NULL;
+        s_monitor_ref_jpeg_len = 0;
+    }
+}
+
+static void monitor_set_reference(const uint8_t *jpeg, size_t len)
+{
+    monitor_clear_reference();
+    if (jpeg == NULL || len == 0) {
+        return;
+    }
+    uint8_t *copy = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+    if (copy == NULL) {
+        ESP_LOGE(TAG, "failed to allocate monitor reference frame");
+        return;
+    }
+    memcpy(copy, jpeg, len);
+    s_monitor_ref_jpeg = copy;
+    s_monitor_ref_jpeg_len = len;
+}
+
+static void monitor_start(void)
+{
+    xSemaphoreTake(s_monitor_mutex, portMAX_DELAY);
+    s_monitor_state = MONITOR_STATE_ACTIVE;
+    s_monitor_deadline_ms = xTaskGetTickCount() * portTICK_PERIOD_MS + MONITOR_DEFAULT_DURATION_MS;
+    monitor_clear_reference();
+    xSemaphoreGive(s_monitor_mutex);
+    ESP_LOGI(TAG, "monitoring started");
+}
+
+static void monitor_stop(void)
+{
+    xSemaphoreTake(s_monitor_mutex, portMAX_DELAY);
+    s_monitor_state = MONITOR_STATE_IDLE;
+    s_monitor_deadline_ms = 0;
+    monitor_clear_reference();
+    xSemaphoreGive(s_monitor_mutex);
+    ESP_LOGI(TAG, "monitoring stopped");
+}
+
+static bool monitor_is_active(void)
+{
+    if (s_monitor_mutex == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_monitor_mutex, portMAX_DELAY);
+    bool active = (s_monitor_state == MONITOR_STATE_ACTIVE);
+    if (active) {
+        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (now >= s_monitor_deadline_ms) {
+            s_monitor_state = MONITOR_STATE_IDLE;
+            monitor_clear_reference();
+            active = false;
+            ESP_LOGI(TAG, "monitoring timed out");
+        }
+    }
+    xSemaphoreGive(s_monitor_mutex);
+    return active;
+}
+
 static bool s_camera_get_new_vb(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data);
 static bool s_camera_get_finished_trans(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data);
 static void http_test_request(void);
+
+static void run_vlm_tts_pipeline(const char *question, const uint8_t *jpeg_data, size_t jpeg_len);
+static bool question_needs_camera(const char *text);
+
+/* Return true if the user question likely requires visual information. */
+static bool question_needs_camera(const char *text)
+{
+    if (text == NULL) {
+        return false;
+    }
+
+    static const char *keywords[] = {
+        "看见", "看到", "画面", "摄像头", "图片", "照片",
+        "描述", "这里", "这", "那", "前面", "周围", "啥", "什么",
+        NULL
+    };
+
+    for (int i = 0; keywords[i] != NULL; i++) {
+        if (strstr(text, keywords[i]) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void run_vlm_tts_pipeline(const char *question, const uint8_t *jpeg_data, size_t jpeg_len)
+{
+    if (question == NULL) {
+        return;
+    }
+
+    cloud_response_t vlm_result = {0};
+    esp_err_t ret = cloud_vlm_ask(question, jpeg_data, jpeg_len, &vlm_result);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "VLM failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "VLM result: %s", vlm_result.text);
+
+    int16_t *tts_pcm = NULL;
+    size_t tts_samples = 0;
+    ret = cloud_tts_speak(vlm_result.text, &tts_pcm, &tts_samples);
+    cloud_response_free(&vlm_result);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "TTS failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "TTS generated %zu samples, playing...", tts_samples);
+    audio_play_pcm(tts_pcm, tts_samples);
+    cloud_pcm_free(tts_pcm);
+}
 
 #if CONFIG_WAKE_WORD_ENABLED
 static void on_wake_word_detected(void)
@@ -61,37 +232,216 @@ static void on_wake_word_detected(void)
         return;
     }
     ESP_LOGI(TAG, "ASR result: %s", asr_result.text);
-
-    /* VLM: image question answering (mock uses NULL image for now). */
-    cloud_response_t vlm_result = {0};
-    ret = cloud_vlm_ask(asr_result.text, NULL, 0, &vlm_result);
-    cloud_response_free(&asr_result);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "VLM failed: %s", esp_err_to_name(ret));
+    if (asr_result.text == NULL || asr_result.text[0] == '\0') {
+        ESP_LOGW(TAG, "ASR returned empty text, skipping VLM/TTS");
+        cloud_response_free(&asr_result);
         return;
     }
-    ESP_LOGI(TAG, "VLM result: %s", vlm_result.text);
 
-    /* TTS: text to speech and play. */
+    /* Handle monitoring start/stop commands. */
+    bool start_monitor = false;
+    if (monitor_is_command(asr_result.text, &start_monitor)) {
+        if (start_monitor) {
+            monitor_start();
+            /* Capture the first frame as the reference. */
+            uint8_t *ref_jpeg = NULL;
+            size_t ref_len = 0;
+            if (s_frame_buffer != NULL && s_cam_capture_mutex != NULL) {
+                xSemaphoreTake(s_cam_capture_mutex, portMAX_DELAY);
+                esp_err_t cap_ret = camera_capture_jpeg((const uint8_t *)s_frame_buffer,
+                                                        s_cam_width, s_cam_height,
+                                                        &ref_jpeg, &ref_len);
+                xSemaphoreGive(s_cam_capture_mutex);
+                if (cap_ret == ESP_OK) {
+                    monitor_set_reference(ref_jpeg, ref_len);
+                    heap_caps_free(ref_jpeg);
+                }
+            }
+            run_vlm_tts_pipeline("已开始监测环境，我会把检测到的变化语音告诉你。", NULL, 0);
+        } else {
+            monitor_stop();
+            run_vlm_tts_pipeline("监测已结束。", NULL, 0);
+        }
+        cloud_response_free(&asr_result);
+        return;
+    }
+
+    /* Capture a frame only when the question likely needs visual context. */
+    uint8_t *jpeg_buf = NULL;
+    size_t jpeg_len = 0;
+    bool need_camera = question_needs_camera(asr_result.text);
+    ESP_LOGI(TAG, "question needs camera: %s", need_camera ? "yes" : "no");
+    if (need_camera && s_frame_buffer != NULL && s_cam_capture_mutex != NULL) {
+        xSemaphoreTake(s_cam_capture_mutex, portMAX_DELAY);
+        esp_err_t cap_ret = camera_capture_jpeg((const uint8_t *)s_frame_buffer,
+                                                s_cam_width, s_cam_height,
+                                                &jpeg_buf, &jpeg_len);
+        xSemaphoreGive(s_cam_capture_mutex);
+        if (cap_ret != ESP_OK) {
+            ESP_LOGW(TAG, "failed to capture frame for VLM");
+        }
+    }
+
+    /* VLM + TTS pipeline. */
+    run_vlm_tts_pipeline(asr_result.text, jpeg_buf, jpeg_len);
+    cloud_response_free(&asr_result);
+    if (jpeg_buf != NULL) {
+        heap_caps_free(jpeg_buf);
+    }
+
+    ESP_LOGI(TAG, "interaction pipeline done");
+}
+#endif
+
+#if CONFIG_PIR_SENSOR_ENABLED
+
+/* Return true if the VLM response indicates no meaningful change. */
+static bool monitor_response_is_silent(const char *text)
+{
+    if (text == NULL || text[0] == '\0') {
+        return true;
+    }
+    if (strstr(text, "NO_CHANGE") != NULL) {
+        return true;
+    }
+    if (strstr(text, "没有变化") != NULL || strstr(text, "无变化") != NULL ||
+        strstr(text, "没有明显变化") != NULL || strstr(text, "无明显变化") != NULL) {
+        return true;
+    }
+    return false;
+}
+
+static void on_pir_motion_detected(void)
+{
+    ESP_LOGI(TAG, "PIR motion detected callback");
+
+    if (s_frame_buffer == NULL) {
+        ESP_LOGW(TAG, "camera not ready, ignoring PIR event");
+        return;
+    }
+
+    xSemaphoreTake(s_monitor_mutex, portMAX_DELAY);
+
+    /* Check monitoring state and timeout. */
+    if (s_monitor_state != MONITOR_STATE_ACTIVE) {
+        xSemaphoreGive(s_monitor_mutex);
+        return;
+    }
+
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    if (now >= s_monitor_deadline_ms) {
+        s_monitor_state = MONITOR_STATE_IDLE;
+        monitor_clear_reference();
+        xSemaphoreGive(s_monitor_mutex);
+        run_vlm_tts_pipeline("监测已自动结束。", NULL, 0);
+        return;
+    }
+
+    if (now - s_monitor_last_pir_ms < MONITOR_PIR_COOLDOWN_MS) {
+        ESP_LOGI(TAG, "PIR event within monitoring cooldown, skip");
+        xSemaphoreGive(s_monitor_mutex);
+        return;
+    }
+    s_monitor_last_pir_ms = now;
+
+    xSemaphoreGive(s_monitor_mutex);
+
+    /* Capture current frame. */
+    uint8_t *cur_jpeg = NULL;
+    size_t cur_len = 0;
+    xSemaphoreTake(s_cam_capture_mutex, portMAX_DELAY);
+    esp_err_t ret = camera_capture_jpeg((const uint8_t *)s_frame_buffer,
+                                        s_cam_width, s_cam_height,
+                                        &cur_jpeg, &cur_len);
+    xSemaphoreGive(s_cam_capture_mutex);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "monitor keyframe capture failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    xSemaphoreTake(s_monitor_mutex, portMAX_DELAY);
+
+    /* First trigger: save reference frame and stay silent. */
+    if (s_monitor_ref_jpeg == NULL) {
+        monitor_set_reference(cur_jpeg, cur_len);
+        xSemaphoreGive(s_monitor_mutex);
+        heap_caps_free(cur_jpeg);
+        ESP_LOGI(TAG, "monitor reference frame saved");
+        return;
+    }
+
+    /* Copy reference frame data while holding the lock, so it remains valid
+     * even if monitoring is stopped concurrently. */
+    uint8_t *ref_jpeg = NULL;
+    size_t ref_len = 0;
+    if (s_monitor_ref_jpeg != NULL && s_monitor_ref_jpeg_len > 0) {
+        ref_jpeg = (uint8_t *)heap_caps_malloc(s_monitor_ref_jpeg_len, MALLOC_CAP_SPIRAM);
+        if (ref_jpeg != NULL) {
+            memcpy(ref_jpeg, s_monitor_ref_jpeg, s_monitor_ref_jpeg_len);
+            ref_len = s_monitor_ref_jpeg_len;
+        }
+    }
+    xSemaphoreGive(s_monitor_mutex);
+
+    if (ref_jpeg == NULL) {
+        ESP_LOGE(TAG, "failed to copy reference frame for comparison");
+        heap_caps_free(cur_jpeg);
+        return;
+    }
+
+    /* Ask LLM to compare reference and current frames. */
+    const char *prompt = "第一张图是之前的场景，第二张图是现在的场景。"
+                         "请比较两张图片。如果环境没有明显变化，请只回复 'NO_CHANGE'；"
+                         "如果有变化，请用一句话简要描述变化内容。";
+
+    cloud_response_t vlm_result = {0};
+    ret = cloud_vlm_ask_with_reference(prompt,
+                                       ref_jpeg, ref_len,
+                                       cur_jpeg, cur_len,
+                                       &vlm_result);
+    heap_caps_free(ref_jpeg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "monitor VLM comparison failed: %s", esp_err_to_name(ret));
+        heap_caps_free(cur_jpeg);
+        return;
+    }
+
+    if (monitor_response_is_silent(vlm_result.text)) {
+        ESP_LOGI(TAG, "monitor: no change detected, stay silent");
+        cloud_response_free(&vlm_result);
+        heap_caps_free(cur_jpeg);
+        return;
+    }
+
+    ESP_LOGI(TAG, "monitor: change detected: %s", vlm_result.text);
+
+    /* Update reference frame to current to avoid repeated alerts. */
+    xSemaphoreTake(s_monitor_mutex, portMAX_DELAY);
+    monitor_set_reference(cur_jpeg, cur_len);
+    xSemaphoreGive(s_monitor_mutex);
+    heap_caps_free(cur_jpeg);
+
+    /* TTS alert. */
     int16_t *tts_pcm = NULL;
     size_t tts_samples = 0;
     ret = cloud_tts_speak(vlm_result.text, &tts_pcm, &tts_samples);
     cloud_response_free(&vlm_result);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "TTS failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "monitor TTS failed: %s", esp_err_to_name(ret));
         return;
     }
-    ESP_LOGI(TAG, "TTS generated %zu samples, playing...", tts_samples);
     audio_play_pcm(tts_pcm, tts_samples);
     cloud_pcm_free(tts_pcm);
-
-    ESP_LOGI(TAG, "interaction pipeline done");
 }
 #endif
 
 void app_main(void)
 {
     esp_err_t ret = ESP_FAIL;
+
+    s_cam_capture_mutex = xSemaphoreCreateMutex();
+    monitor_init();
+    cloud_api_init();
 
     //---------------Wi-Fi & Network Init------------------//
     ret = wifi_connect();
@@ -122,10 +472,12 @@ void app_main(void)
      */
     //---------------DSI Init------------------//
     example_dsi_resource_alloc(&mipi_dsi_bus, &mipi_dbi_io, &mipi_dpi_panel, &frame_buffer);
+    s_frame_buffer = frame_buffer;
 
     //---------------Necessary variable config------------------//
     frame_buffer_size = CONFIG_EXAMPLE_MIPI_CSI_DISP_HRES * CONFIG_EXAMPLE_MIPI_DSI_DISP_VRES * EXAMPLE_RGB565_BITS_PER_PIXEL / 8;
 
+    s_frame_buffer_size = frame_buffer_size;
     ESP_LOGD(TAG, "CONFIG_EXAMPLE_MIPI_CSI_DISP_HRES: %d, CONFIG_EXAMPLE_MIPI_DSI_DISP_VRES: %d, bits per pixel: %d", CONFIG_EXAMPLE_MIPI_CSI_DISP_HRES, CONFIG_EXAMPLE_MIPI_DSI_DISP_VRES, EXAMPLE_RGB565_BITS_PER_PIXEL);
     ESP_LOGD(TAG, "frame_buffer_size: %zu", frame_buffer_size);
     ESP_LOGD(TAG, "frame_buffer: %p", frame_buffer);
@@ -173,6 +525,17 @@ void app_main(void)
 #endif
     }
 
+    //---------------PIR Sensor Init------------------//
+#if CONFIG_PIR_SENSOR_ENABLED
+    ret = pir_init((gpio_num_t)CONFIG_PIR_SENSOR_GPIO);
+    if (ret == ESP_OK) {
+        pir_register_callback(on_pir_motion_detected);
+        pir_start();
+    } else {
+        ESP_LOGE(TAG, "PIR init failed");
+    }
+#endif
+
     //---------------CSI Init------------------//
     esp_cam_ctlr_csi_config_t csi_config = {
         .ctlr_id = 0,
@@ -189,6 +552,17 @@ void app_main(void)
     ret = esp_cam_new_csi_ctlr(&csi_config, &cam_handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "csi init fail[%d]", ret);
+        return;
+    }
+    s_cam_handle = cam_handle;
+    s_cam_width = CONFIG_EXAMPLE_MIPI_CSI_DISP_HRES;
+    s_cam_height = CONFIG_EXAMPLE_MIPI_CSI_DISP_VRES;
+
+    /* Pre-allocate camera capture buffers so JPEG encoding does not need to
+     * allocate large buffers at runtime. */
+    ret = camera_capture_init(s_cam_width, s_cam_height);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "camera capture init failed: %s", esp_err_to_name(ret));
         return;
     }
 
@@ -261,7 +635,6 @@ static void http_test_request(void)
         .method = HTTP_METHOD_GET,
         .timeout_ms = 10000,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        .user_data = local_response_buffer,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -270,15 +643,29 @@ static void http_test_request(void)
         return;
     }
 
-    esp_err_t err = esp_http_client_perform(client);
-    if (err == ESP_OK) {
-        int status_code = esp_http_client_get_status_code(client);
-        int content_length = esp_http_client_get_content_length(client);
-        ESP_LOGI(TAG, "HTTP GET Status = %d, content_length = %d", status_code, content_length);
-        ESP_LOGI(TAG, "HTTP Response:\n%s", local_response_buffer);
-    } else {
-        ESP_LOGE(TAG, "HTTP GET request failed: %s", esp_err_to_name(err));
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "http client open failed: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return;
     }
+
+    int content_length = esp_http_client_fetch_headers(client);
+    int status_code = esp_http_client_get_status_code(client);
+    ESP_LOGI(TAG, "HTTP GET Status = %d, content_length = %d", status_code, content_length);
+
+    int total_read = 0;
+    int r = 0;
+    while (total_read < MAX_HTTP_OUTPUT_BUFFER - 1) {
+        r = esp_http_client_read(client, local_response_buffer + total_read,
+                                 MAX_HTTP_OUTPUT_BUFFER - 1 - total_read);
+        if (r <= 0) {
+            break;
+        }
+        total_read += r;
+    }
+    local_response_buffer[total_read] = '\0';
+    ESP_LOGI(TAG, "HTTP Response (%d bytes):\n%s", total_read, local_response_buffer);
 
     esp_http_client_cleanup(client);
 }

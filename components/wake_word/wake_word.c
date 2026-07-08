@@ -45,10 +45,15 @@ static void wake_word_task(void *arg)
         return;
     }
 
-    int16_t *buffer = (int16_t *)heap_caps_malloc(chunk_samples * sizeof(int16_t),
+    /* Codec runs stereo, but WakeNet expects mono 16-bit PCM. */
+    int16_t *mono = (int16_t *)heap_caps_malloc(chunk_samples * sizeof(int16_t),
+                                                MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    int16_t *stereo = (int16_t *)heap_caps_malloc(chunk_samples * sizeof(int16_t) * 2,
                                                   MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    if (buffer == NULL) {
+    if (mono == NULL || stereo == NULL) {
         ESP_LOGE(TAG, "failed to allocate wake word buffer");
+        free(mono);
+        free(stereo);
         vTaskDelete(NULL);
         return;
     }
@@ -56,15 +61,35 @@ static void wake_word_task(void *arg)
     ESP_LOGI(TAG, "wake word task started, chunk_samples=%d", chunk_samples);
 
     while (true) {
-        memset(buffer, 0, chunk_samples * sizeof(int16_t));
-        int ret = esp_codec_dev_read(codec, buffer, chunk_samples * sizeof(int16_t));
+        memset(mono, 0, chunk_samples * sizeof(int16_t));
+        memset(stereo, 0, chunk_samples * sizeof(int16_t) * 2);
+        audio_codec_lock();
+        int ret = esp_codec_dev_read(codec, stereo, chunk_samples * sizeof(int16_t) * 2);
+        audio_codec_unlock();
         if (ret != ESP_CODEC_DEV_OK) {
             ESP_LOGE(TAG, "codec read failed: %d", ret);
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
-        wakenet_state_t state = s_wakenet->detect(s_model_data, buffer);
+        /* Extract left channel from interleaved stereo. */
+        int32_t peak = 0;
+        for (int i = 0; i < chunk_samples; i++) {
+            mono[i] = stereo[i * 2];
+            int32_t v = mono[i] >= 0 ? mono[i] : -mono[i];
+            if (v > peak) {
+                peak = v;
+            }
+        }
+
+        /* Log audio peak level occasionally to help verify microphone. */
+        static int loop_cnt = 0;
+        if (++loop_cnt >= 100) {
+            loop_cnt = 0;
+            ESP_LOGI(TAG, "audio peak level: %ld", peak);
+        }
+
+        wakenet_state_t state = s_wakenet->detect(s_model_data, mono);
         if (state == WAKENET_DETECTED) {
             ESP_LOGI(TAG, "wake word detected");
             if (s_wake_cb != NULL) {

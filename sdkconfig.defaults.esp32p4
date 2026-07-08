@@ -22,3 +22,18 @@ CONFIG_AUDIO_ENABLE_LOOPBACK_TEST=n
 
 # Wake word model: 你好小智 (Chinese, WakeNet9s)
 CONFIG_SR_WN_WN9S_NIHAOXIAOZHI=y
+
+# PIR motion sensor on GPIO20 (J1 header pin 13)
+CONFIG_PIR_SENSOR_ENABLED=y
+CONFIG_PIR_SENSOR_GPIO=20
+
+# Use real cloud APIs (Baidu ASR/TTS + Volcano VLM)
+CONFIG_CLOUD_API_USE_MOCK=n
+
+# Increase main task stack: app_main allocates LCD/camera frame buffers and runs init code on it.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# Move mbedTLS buffers to PSRAM so HTTPS connections (Baidu/Volcano) do not
+# exhaust internal RAM after audio/camera allocations.
+CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=n
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
