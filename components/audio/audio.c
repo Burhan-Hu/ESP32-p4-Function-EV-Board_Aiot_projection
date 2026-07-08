@@ -25,6 +25,11 @@ static const char *TAG = "audio";
 #define AUDIO_CHANNELS          2
 #define AUDIO_MCLK_MULTIPLE     384
 #define AUDIO_LOOPBACK_BUF_SIZE (16000 * sizeof(int16_t) * 2) /* 0.5s stereo @ 16kHz */
+#define AUDIO_RECORD_MAX_MS     5000
+
+static int16_t *s_record_stereo_buf = NULL;
+static int16_t *s_record_mono_buf = NULL;
+static SemaphoreHandle_t s_record_buf_mutex = NULL;
 
 static i2s_chan_handle_t s_tx_handle = NULL;
 static i2s_chan_handle_t s_rx_handle = NULL;
@@ -63,6 +68,7 @@ static esp_err_t audio_i2s_init(void)
 }
 
 static i2c_master_bus_handle_t s_i2c_bus_handle = NULL;
+static SemaphoreHandle_t s_codec_mutex = NULL;
 
 static esp_err_t audio_codec_init(i2c_master_bus_handle_t i2c_bus_handle)
 {
@@ -145,6 +151,35 @@ esp_err_t audio_init(i2c_master_bus_handle_t i2c_bus_handle)
     ESP_LOGI(TAG, "Initializing audio (ES8311 @ shared I2C bus, I2S%d)...", I2S_NUM_0);
     ESP_RETURN_ON_ERROR(audio_i2s_init(), TAG, "i2s init failed");
     ESP_RETURN_ON_ERROR(audio_codec_init(i2c_bus_handle), TAG, "codec init failed");
+
+    s_codec_mutex = xSemaphoreCreateMutex();
+    if (s_codec_mutex == NULL) {
+        ESP_LOGE(TAG, "failed to create codec mutex");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Pre-allocate recording buffers to avoid runtime fragmentation. */
+    s_record_buf_mutex = xSemaphoreCreateMutex();
+    if (s_record_buf_mutex == NULL) {
+        ESP_LOGE(TAG, "failed to create record buffer mutex");
+        return ESP_ERR_NO_MEM;
+    }
+
+    const size_t max_stereo_samples = (AUDIO_SAMPLE_RATE * AUDIO_RECORD_MAX_MS) / 1000;
+    s_record_stereo_buf = (int16_t *)heap_caps_malloc(max_stereo_samples * sizeof(int16_t) * AUDIO_CHANNELS,
+                                                      MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (s_record_stereo_buf == NULL) {
+        ESP_LOGE(TAG, "failed to pre-allocate stereo record buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_record_mono_buf = (int16_t *)heap_caps_malloc(max_stereo_samples * sizeof(int16_t),
+                                                    MALLOC_CAP_SPIRAM);
+    if (s_record_mono_buf == NULL) {
+        ESP_LOGE(TAG, "failed to pre-allocate mono record buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
     ESP_LOGI(TAG, "Audio initialized successfully");
     return ESP_OK;
 }
@@ -154,50 +189,72 @@ void *audio_get_codec_handle(void)
     return (void *)s_codec_handle;
 }
 
+void audio_codec_lock(void)
+{
+    if (s_codec_mutex != NULL) {
+        xSemaphoreTake(s_codec_mutex, portMAX_DELAY);
+    }
+}
+
+void audio_codec_unlock(void)
+{
+    if (s_codec_mutex != NULL) {
+        xSemaphoreGive(s_codec_mutex);
+    }
+}
+
 esp_err_t audio_record(int duration_ms, int16_t **pcm_out, size_t *sample_count)
 {
     if (s_codec_handle == NULL || pcm_out == NULL || sample_count == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (duration_ms <= 0) {
+    if (duration_ms <= 0 || duration_ms > AUDIO_RECORD_MAX_MS) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (s_record_stereo_buf == NULL || s_record_mono_buf == NULL) {
+        ESP_LOGE(TAG, "record buffers not initialized");
+        return ESP_ERR_INVALID_STATE;
     }
 
     const size_t mono_samples = (size_t)((AUDIO_SAMPLE_RATE * duration_ms) / 1000);
     const size_t stereo_samples = mono_samples * AUDIO_CHANNELS;
     const size_t stereo_bytes = stereo_samples * sizeof(int16_t);
 
-    int16_t *stereo_buf = (int16_t *)heap_caps_malloc(stereo_bytes,
-                                                       MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    if (stereo_buf == NULL) {
-        ESP_LOGE(TAG, "failed to allocate stereo record buffer");
-        return ESP_ERR_NO_MEM;
-    }
+    xSemaphoreTake(s_record_buf_mutex, portMAX_DELAY);
 
-    int ret = esp_codec_dev_read(s_codec_handle, stereo_buf, (int)stereo_bytes);
+    audio_codec_lock();
+    int ret = esp_codec_dev_read(s_codec_handle, s_record_stereo_buf, (int)stereo_bytes);
+    audio_codec_unlock();
     if (ret != ESP_CODEC_DEV_OK) {
         ESP_LOGE(TAG, "codec read failed: %d", ret);
-        heap_caps_free(stereo_buf);
+        xSemaphoreGive(s_record_buf_mutex);
         return ESP_FAIL;
     }
 
+    /* Extract left channel from interleaved stereo data. */
+    int32_t peak = 0;
+    for (size_t i = 0; i < mono_samples; i++) {
+        s_record_mono_buf[i] = s_record_stereo_buf[i * AUDIO_CHANNELS];
+        int32_t v = s_record_mono_buf[i] >= 0 ? s_record_mono_buf[i] : -s_record_mono_buf[i];
+        if (v > peak) {
+            peak = v;
+        }
+    }
+
+    /* Copy the captured mono data into a caller-owned buffer in PSRAM. */
     int16_t *mono_buf = (int16_t *)heap_caps_malloc(mono_samples * sizeof(int16_t),
-                                                    MALLOC_CAP_INTERNAL);
+                                                    MALLOC_CAP_SPIRAM);
     if (mono_buf == NULL) {
         ESP_LOGE(TAG, "failed to allocate mono record buffer");
-        heap_caps_free(stereo_buf);
+        xSemaphoreGive(s_record_buf_mutex);
         return ESP_ERR_NO_MEM;
     }
+    memcpy(mono_buf, s_record_mono_buf, mono_samples * sizeof(int16_t));
+    xSemaphoreGive(s_record_buf_mutex);
 
-    /* Extract left channel from interleaved stereo data. */
-    for (size_t i = 0; i < mono_samples; i++) {
-        mono_buf[i] = stereo_buf[i * AUDIO_CHANNELS];
-    }
-
-    heap_caps_free(stereo_buf);
     *pcm_out = mono_buf;
     *sample_count = mono_samples;
-    ESP_LOGI(TAG, "recorded %zu mono samples (%d ms)", mono_samples, duration_ms);
+    ESP_LOGI(TAG, "recorded %zu mono samples (%d ms), peak=%ld", mono_samples, duration_ms, peak);
     return ESP_OK;
 }
 
@@ -210,28 +267,42 @@ esp_err_t audio_play_pcm(const int16_t *pcm, size_t sample_count)
         return ESP_OK;
     }
 
-    const size_t stereo_samples = sample_count * AUDIO_CHANNELS;
-    const size_t stereo_bytes = stereo_samples * sizeof(int16_t);
+    /* Stream playback using a small fixed-size DMA buffer to avoid large
+     * allocations for long TTS responses. */
+    const size_t chunk_mono_samples = 1024;
+    const size_t chunk_stereo_samples = chunk_mono_samples * AUDIO_CHANNELS;
+    const size_t chunk_stereo_bytes = chunk_stereo_samples * sizeof(int16_t);
 
-    int16_t *stereo_buf = (int16_t *)heap_caps_malloc(stereo_bytes,
+    int16_t *stereo_buf = (int16_t *)heap_caps_malloc(chunk_stereo_bytes,
                                                        MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     if (stereo_buf == NULL) {
-        ESP_LOGE(TAG, "failed to allocate playback buffer");
+        ESP_LOGE(TAG, "failed to allocate playback chunk buffer");
         return ESP_ERR_NO_MEM;
     }
 
-    /* Duplicate mono samples to both channels. */
-    for (size_t i = 0; i < sample_count; i++) {
-        stereo_buf[i * AUDIO_CHANNELS]     = pcm[i];
-        stereo_buf[i * AUDIO_CHANNELS + 1] = pcm[i];
-    }
+    audio_codec_lock();
+    size_t offset = 0;
+    while (offset < sample_count) {
+        size_t remaining = sample_count - offset;
+        size_t cur_mono = (remaining < chunk_mono_samples) ? remaining : chunk_mono_samples;
+        size_t cur_stereo_bytes = cur_mono * AUDIO_CHANNELS * sizeof(int16_t);
 
-    int ret = esp_codec_dev_write(s_codec_handle, stereo_buf, (int)stereo_bytes);
-    heap_caps_free(stereo_buf);
-    if (ret != ESP_CODEC_DEV_OK) {
-        ESP_LOGE(TAG, "codec write failed: %d", ret);
-        return ESP_FAIL;
+        for (size_t i = 0; i < cur_mono; i++) {
+            stereo_buf[i * AUDIO_CHANNELS]     = pcm[offset + i];
+            stereo_buf[i * AUDIO_CHANNELS + 1] = pcm[offset + i];
+        }
+
+        int ret = esp_codec_dev_write(s_codec_handle, stereo_buf, (int)cur_stereo_bytes);
+        if (ret != ESP_CODEC_DEV_OK) {
+            audio_codec_unlock();
+            heap_caps_free(stereo_buf);
+            ESP_LOGE(TAG, "codec write failed: %d", ret);
+            return ESP_FAIL;
+        }
+        offset += cur_mono;
     }
+    audio_codec_unlock();
+    heap_caps_free(stereo_buf);
     return ESP_OK;
 }
 
