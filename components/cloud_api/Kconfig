@@ -2,7 +2,7 @@ menu "Cloud API Configuration"
 
     config CLOUD_API_USE_MOCK
         bool "Use mock cloud API (no network required)"
-        default y
+        default n
         help
             When enabled, ASR/VLM/TTS return fixed responses and a synthetic
             tone, so the interaction pipeline can be tested without real
@@ -36,12 +36,22 @@ menu "Cloud API Configuration"
         string "Volcano Engine endpoint"
         default "https://ark.cn-beijing.volces.com/api/v3"
         help
-            Base URL for Volcano Engine Ark API.
+            Base URL for Volcano Engine Ark API. The code appends
+            /chat/completions to this base URL internally.
 
     config CLOUD_API_VOLCANO_VLM_MODEL
         string "Volcano VLM model"
         default "doubao-vision-lite-32k"
         help
             Model name for visual question answering, e.g. doubao-vision-lite-32k.
+
+    config CLOUD_API_VLM_HISTORY_MAX
+        int "Max VLM conversation history turns"
+        default 6
+        range 0 20
+        help
+            Number of recent conversation turns to keep for VLM context.
+            Each turn is a user message plus an assistant reply. Set 0 to
+            disable context memory.
 
 endmenu

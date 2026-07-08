@@ -36,6 +36,19 @@ esp_err_t audio_init(i2c_master_bus_handle_t i2c_bus_handle);
 void *audio_get_codec_handle(void);
 
 /**
+ * @brief Lock the codec device for exclusive access.
+ *
+ * Any code reading from or writing to the codec (e.g. wake word task,
+ * audio_record()) must hold this lock to avoid interleaved samples.
+ */
+void audio_codec_lock(void);
+
+/**
+ * @brief Unlock the codec device.
+ */
+void audio_codec_unlock(void);
+
+/**
  * @brief Record mono 16-bit 16 kHz PCM audio from the microphone.
  *
  * The function allocates a DMA-capable buffer internally, reads stereo data

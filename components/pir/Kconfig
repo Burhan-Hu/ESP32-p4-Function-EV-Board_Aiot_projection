@@ -1,0 +1,26 @@
+menu "PIR Sensor Configuration"
+
+    config PIR_SENSOR_ENABLED
+        bool "Enable PIR motion sensor"
+        default y
+        help
+            Start a task that monitors the PIR sensor output pin and logs
+            motion events. The pin can be selected below.
+
+    config PIR_SENSOR_GPIO
+        int "PIR sensor OUT GPIO number"
+        depends on PIR_SENSOR_ENABLED
+        default 20
+        range 0 54
+        help
+            GPIO connected to the PIR sensor OUT signal.
+            On ESP32-P4-Function-EV-Board J1 header, GPIO20 is pin 13.
+
+    config PIR_SENSOR_TASK_STACK_SIZE
+        int "PIR sensor task stack size"
+        depends on PIR_SENSOR_ENABLED
+        default 4096
+        help
+            Stack size for the PIR monitoring task.
+
+endmenu
