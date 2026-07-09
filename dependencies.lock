@@ -8,7 +8,7 @@ dependencies:
     - name: idf
       version: '>=5.3.0'
     source:
-      path: E:\Tools\ESP-IDF\Espressif\frameworks\esp-idf-v5.5.2\examples\peripherals\camera\common_components\dsi_init
+      path: ${IDF_PATH}/examples/peripherals/camera/common_components/dsi_init
       type: local
     version: '*'
   espressif/cjson:
@@ -225,7 +225,7 @@ dependencies:
     - name: idf
       version: '>=5.3.0'
     source:
-      path: E:\Tools\ESP-IDF\Espressif\frameworks\esp-idf-v5.5.2\examples\peripherals\camera\common_components\sensor_init
+      path: ${IDF_PATH}/examples/peripherals/camera/common_components/sensor_init
       type: local
     version: '*'
 direct_dependencies:

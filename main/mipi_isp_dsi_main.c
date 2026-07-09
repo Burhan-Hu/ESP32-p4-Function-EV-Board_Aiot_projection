@@ -27,6 +27,7 @@
 #include "esp_crt_bundle.h"
 #include "audio.h"
 #include "cloud_api.h"
+#include "ui_manager.h"
 #if CONFIG_WAKE_WORD_ENABLED
 #include "wake_word.h"
 #endif
@@ -101,6 +102,29 @@ void app_main(void)
         http_test_request();
     }
 
+    // UI demo 仅用于验证视频叠层流程，后续由算法/事件模块喂状态。
+    ui_manager_init();
+    ui_model_t initial_ui = {
+        .wifi_connected = (ret == ESP_OK),
+        .camera_ok = false,
+        .privacy_on = false,
+        .learn_score = 86,
+        .risk_level = 1,
+        .seat_state = "检测中",
+        .screen_state = "等待课程开始",
+        .pose_state = "检测中",
+        .event_type = "学习状态提醒",
+        .event_message = "准备好后就可以开始学习。",
+        .summary_title = "今日课程",
+        .summary_text = "1. 等待课程内容同步\n2. 准备进入专注守护",
+        .study_seconds = 0,
+        .event_duration_seconds = 0,
+        .homework_text = "暂无作业提醒",
+        .course_title = "智能伴学课程",
+    };
+    ui_manager_update(&initial_ui);
+    ui_manager_show_page(UI_PAGE_IDLE);
+
     esp_lcd_dsi_bus_handle_t mipi_dsi_bus = NULL;
     esp_lcd_panel_io_handle_t mipi_dbi_io = NULL;
     esp_lcd_panel_handle_t mipi_dpi_panel = NULL;
@@ -149,6 +173,9 @@ void app_main(void)
     };
     example_sensor_init(&cam_sensor_config, &sensor_handle);
     ESP_LOGI(TAG, "sensor init done");
+
+    initial_ui.camera_ok = true;
+    ui_manager_update(&initial_ui);
 
     //---------------Audio Init------------------//
     ret = audio_init(sensor_handle.i2c_bus_handle);

@@ -2416,6 +2416,13 @@ CONFIG_CLOUD_API_VOLCANO_VLM_MODEL="doubao-vision-lite-32k"
 # end of Cloud API Configuration
 
 #
+# Guardian UI
+#
+CONFIG_UI_MANAGER_DEMO_ENABLE=y
+# CONFIG_UI_MANAGER_USE_LVGL is not set
+# end of Guardian UI
+
+#
 # Wake Word Configuration
 #
 CONFIG_WAKE_WORD_ENABLED=y
