@@ -3,6 +3,7 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,7 @@
 #include "cloud_api.h"
 #include "pir.h"
 #include "camera_capture.h"
+#include "human_detect.h"
 #if CONFIG_WAKE_WORD_ENABLED
 #include "wake_word.h"
 #endif
@@ -159,6 +161,8 @@ static void http_test_request(void);
 
 static void run_vlm_tts_pipeline(const char *question, const uint8_t *jpeg_data, size_t jpeg_len);
 static bool question_needs_camera(const char *text);
+static bool app_human_frame_reader(uint8_t *dst, size_t dst_len, int *width, int *height, void *ctx);
+static void on_human_left(uint32_t duration_ms);
 
 /* Return true if the user question likely requires visual information. */
 static bool question_needs_camera(const char *text)
@@ -208,6 +212,37 @@ static void run_vlm_tts_pipeline(const char *question, const uint8_t *jpeg_data,
     cloud_pcm_free(tts_pcm);
 }
 
+static bool app_human_frame_reader(uint8_t *dst, size_t dst_len, int *width, int *height, void *ctx)
+{
+    (void)ctx;
+
+    if (dst == NULL || width == NULL || height == NULL ||
+        s_frame_buffer == NULL || s_cam_capture_mutex == NULL ||
+        s_cam_width <= 0 || s_cam_height <= 0) {
+        return false;
+    }
+
+    size_t frame_len = (size_t)s_cam_width * (size_t)s_cam_height * EXAMPLE_RGB565_BITS_PER_PIXEL / 8;
+    if (dst_len < frame_len || s_frame_buffer_size < frame_len) {
+        ESP_LOGW(TAG, "human frame reader buffer too small: dst=%zu frame=%zu live=%zu",
+                 dst_len, frame_len, s_frame_buffer_size);
+        return false;
+    }
+
+    xSemaphoreTake(s_cam_capture_mutex, portMAX_DELAY);
+    esp_cache_msync(s_frame_buffer, frame_len, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    memcpy(dst, s_frame_buffer, frame_len);
+    xSemaphoreGive(s_cam_capture_mutex);
+
+    *width = s_cam_width;
+    *height = s_cam_height;
+    return true;
+}
+
+static void on_human_left(uint32_t duration_ms)
+{
+    ESP_LOGI(TAG, "human left callback, presence_duration=%" PRIu32 " ms", duration_ms);
+}
 #if CONFIG_WAKE_WORD_ENABLED
 static void on_wake_word_detected(void)
 {
@@ -471,7 +506,8 @@ void app_main(void)
      * ISP convert to RGB565
      */
     //---------------DSI Init------------------//
-    example_dsi_resource_alloc(&mipi_dsi_bus, &mipi_dbi_io, &mipi_dpi_panel, &frame_buffer);
+    example_dsi_alloc_config_t dsi_alloc_config = EXAMPLE_DSI_ALLOC_CONFIG_DEFAULT();
+    example_dsi_resource_alloc(&dsi_alloc_config, &mipi_dsi_bus, &mipi_dbi_io, &mipi_dpi_panel, &frame_buffer, NULL);
     s_frame_buffer = frame_buffer;
 
     //---------------Necessary variable config------------------//
@@ -618,6 +654,17 @@ void app_main(void)
         return;
     }
     ESP_LOGI(TAG, "first frame received, entering idle loop");
+    ret = human_detect_init();
+    if (ret == ESP_OK) {
+        human_register_left_callback(on_human_left);
+        ret = human_detect_register_frame_reader(app_human_frame_reader, NULL, s_cam_width, s_cam_height);
+        if (ret == ESP_OK) {
+            ret = human_detect_start();
+        }
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "human detection start failed: %s", esp_err_to_name(ret));
+    }
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));

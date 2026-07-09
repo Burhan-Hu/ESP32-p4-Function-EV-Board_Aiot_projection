@@ -1,0 +1,57 @@
+menu "Human Detection Configuration"
+
+    config HUMAN_DETECT_INTERVAL_MS
+        int "Human detection interval in milliseconds"
+        default 250
+        range 50 5000
+        help
+            Delay between two ESP-WHO pedestrian detections.
+
+    config HUMAN_DETECT_TASK_STACK_SIZE
+        int "Human detection task stack size"
+        default 16384
+        range 4096 65536
+        help
+            Stack size for the background detection task.
+
+    config HUMAN_DETECT_TASK_PRIORITY
+        int "Human detection task priority"
+        default 4
+        range 1 20
+        help
+            FreeRTOS task priority for local pedestrian detection.
+
+    config HUMAN_DETECT_CONFIDENCE_THRESHOLD
+        int "Pedestrian confidence threshold percent"
+        default 55
+        range 1 100
+        help
+            Best detection score must be at least this percent to count as a person.
+
+    config HUMAN_DETECT_ENTER_CONFIRM_FRAMES
+        int "Consecutive detected frames before present"
+        default 1
+        range 1 10
+        help
+            Debounce threshold before switching from absent to present.
+
+    config HUMAN_DETECT_LEAVE_TIMEOUT_MS
+        int "Person-left timeout in milliseconds"
+        default 8000
+        range 500 600000
+        help
+            LED turns off only after no person has been detected for this timeout.
+
+    config HUMAN_DETECT_LED_AUTO_CONTROL
+        bool "Automatically control LED by human presence"
+        default y
+        help
+            If enabled, detected person turns the LED on and leave timeout turns it off.
+
+    config HUMAN_DETECT_LOG_EACH_RESULT
+        bool "Log every human detection result"
+        default n
+        help
+            Enable verbose per-frame detection logs for board-level tuning.
+
+endmenu
