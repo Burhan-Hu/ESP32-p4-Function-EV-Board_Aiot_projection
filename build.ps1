@@ -27,7 +27,7 @@ if (-not (Test-Path $batFile)) {
     exit 1
 }
 
-$cmdLine = '"' + $batFile + '" && python.exe "' + $idfPath + '\tools\idf.py" fullclean build'
+$cmdLine = '"' + $batFile + '" && python.exe "' + $idfPath + '\tools\idf.py" build'
 Write-Host "Running: cmd /c $cmdLine"
 cmd /c $cmdLine
 exit $LASTEXITCODE
