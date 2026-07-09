@@ -1,0 +1,32 @@
+menu "LED Controller Configuration"
+
+    config LED_CONTROLLER_GPIO
+        int "LED PWM GPIO"
+        default 21
+        range -1 54
+        help
+            GPIO used to drive the LED or external LED driver PWM input.
+            Set to -1 to compile the controller but disable physical output.
+            GPIO20 is already used by the PIR sensor in this project.
+
+    config LED_CONTROLLER_PWM_FREQ_HZ
+        int "LED PWM frequency"
+        default 5000
+        range 100 40000
+        help
+            PWM frequency for a simple white LED or LED driver input.
+
+    config LED_CONTROLLER_DEFAULT_BRIGHTNESS
+        int "Default LED brightness percent"
+        default 80
+        range 0 100
+        help
+            Brightness used when led_turn_on() is called.
+
+    config LED_CONTROLLER_ACTIVE_HIGH
+        bool "LED is active high"
+        default y
+        help
+            Disable this if the LED driver turns on when PWM duty is low.
+
+endmenu
