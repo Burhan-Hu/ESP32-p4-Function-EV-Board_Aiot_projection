@@ -10,7 +10,6 @@
 #include "sdkconfig.h"
 #include "esp_attr.h"
 #include "esp_log.h"
-#include "esp_idf_version.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_lcd_mipi_dsi.h"
@@ -507,12 +506,8 @@ void app_main(void)
      * ISP convert to RGB565
      */
     //---------------DSI Init------------------//
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 4)
     example_dsi_alloc_config_t dsi_alloc_config = EXAMPLE_DSI_ALLOC_CONFIG_DEFAULT();
     example_dsi_resource_alloc(&dsi_alloc_config, &mipi_dsi_bus, &mipi_dbi_io, &mipi_dpi_panel, &frame_buffer, NULL);
-#else
-    example_dsi_resource_alloc(&mipi_dsi_bus, &mipi_dbi_io, &mipi_dpi_panel, &frame_buffer);
-#endif
     s_frame_buffer = frame_buffer;
 
     //---------------Necessary variable config------------------//
