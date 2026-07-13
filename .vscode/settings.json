@@ -14,5 +14,6 @@
   ],
   "idf.flashType": "JTAG",
   "idf.portWin": "COM5",
-  "idf.monitorPort": "COM5"
+  "idf.monitorPort": "COM5",
+  "git.ignoreLimitWarning": true
 }

@@ -40,7 +40,11 @@ if(SLAVE_FW_BIN_FILES)
 
     add_custom_target(slave_ota_flash_firmware
         DEPENDS slave_ota_select_firmware
-        COMMAND ${PYTHON} -m esptool --chip esp32p4 --before default_reset --after hard_reset write_flash --force --flash_mode dio --flash_size 16MB --flash_freq 80m ${SLAVE_FW_OFFSET} "${CMAKE_CURRENT_BINARY_DIR}/slave_fw_selected.bin"
+        COMMAND ${CMAKE_COMMAND}
+            -D PYTHON=${PYTHON}
+            -D SLAVE_FW_OFFSET=${SLAVE_FW_OFFSET}
+            -D SLAVE_FW_SELECTED=${CMAKE_CURRENT_BINARY_DIR}/slave_fw_selected.bin
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/flash_slave.cmake"
         COMMENT "slave_ota: flashing C6 slave firmware to partition ${SLAVE_FW_PARTITION_NAME}"
         VERBATIM
     )

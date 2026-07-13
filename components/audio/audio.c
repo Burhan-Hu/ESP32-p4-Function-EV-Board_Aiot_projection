@@ -288,8 +288,15 @@ esp_err_t audio_play_pcm(const int16_t *pcm, size_t sample_count)
         size_t cur_stereo_bytes = cur_mono * AUDIO_CHANNELS * sizeof(int16_t);
 
         for (size_t i = 0; i < cur_mono; i++) {
-            stereo_buf[i * AUDIO_CHANNELS]     = pcm[offset + i];
-            stereo_buf[i * AUDIO_CHANNELS + 1] = pcm[offset + i];
+            /* Amplify by 2x ("放大1倍") and clamp to int16 range. */
+            int32_t amplified = (int32_t)pcm[offset + i] * 2;
+            if (amplified > INT16_MAX) {
+                amplified = INT16_MAX;
+            } else if (amplified < INT16_MIN) {
+                amplified = INT16_MIN;
+            }
+            stereo_buf[i * AUDIO_CHANNELS]     = (int16_t)amplified;
+            stereo_buf[i * AUDIO_CHANNELS + 1] = (int16_t)amplified;
         }
 
         int ret = esp_codec_dev_write(s_codec_handle, stereo_buf, (int)cur_stereo_bytes);

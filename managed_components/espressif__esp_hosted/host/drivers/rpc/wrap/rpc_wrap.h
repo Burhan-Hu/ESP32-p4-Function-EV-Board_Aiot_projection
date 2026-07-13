@@ -96,6 +96,7 @@ esp_err_t rpc_wifi_sta_get_negotiated_phymode(wifi_phy_mode_t *phymode);
 esp_err_t rpc_wifi_sta_get_aid(uint16_t *aid);
 esp_err_t rpc_wifi_set_inactive_time(wifi_interface_t ifx, uint16_t sec);
 esp_err_t rpc_wifi_get_inactive_time(wifi_interface_t ifx, uint16_t *sec);
+esp_err_t rpc_wifi_disable_pmf_config(wifi_interface_t ifx);
 esp_err_t rpc_get_coprocessor_fwversion(esp_hosted_coprocessor_fwver_t *ver_info);
 esp_err_t rpc_get_cp_info(uint32_t *cp_chip_id, char *cp_target_name, size_t cp_target_name_len);
 

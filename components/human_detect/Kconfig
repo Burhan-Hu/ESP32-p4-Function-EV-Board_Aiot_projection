@@ -9,7 +9,7 @@ menu "Human Detection Configuration"
 
     config HUMAN_DETECT_TASK_STACK_SIZE
         int "Human detection task stack size"
-        default 16384
+        default 32768
         range 4096 65536
         help
             Stack size for the background detection task.
@@ -41,6 +41,14 @@ menu "Human Detection Configuration"
         range 500 600000
         help
             LED turns off only after no person has been detected for this timeout.
+
+    config HUMAN_DETECT_LEAVE_REMINDER_MS
+        int "Person-left voice-reminder delay in milliseconds"
+        default 60000
+        range 1000 600000
+        help
+            If a registered reminder callback exists, it is fired once after the
+            person has been absent for this duration.
 
     config HUMAN_DETECT_LED_AUTO_CONTROL
         bool "Automatically control LED by human presence"

@@ -2,6 +2,11 @@
 
 # Releases
 
+# $${\color{green} \text{2.12.10}}$$
+
+- added `esp_wifi_disable_pmf_config()` support (host ↔ co-processor RPC); previously returned `ESP_ERR_NOT_SUPPORTED`
+- fixed SDIO RX heap corruption on transport deinit and hardened RX buffer allocation
+
 # $${\color{green} \text{2.12.9}}$$
 
 - added gpios for `ESP32_P4X_C5_Function_EV_Board V2.0`

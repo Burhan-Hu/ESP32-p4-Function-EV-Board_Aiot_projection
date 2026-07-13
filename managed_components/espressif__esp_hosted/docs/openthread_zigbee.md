@@ -120,9 +120,9 @@ Enter the OpenThread section to configure the dedicated OpenThread UART:
 
 ```
 Example Configuration
-└── [*] Enable OpenThread RCP (Radio Co-Processor)
+└── [*] Enable OpenThread RCP (Radio Co-Processor)         <─── ENABLE
     └── OpenThread RCP Configuration
-        ├── OpenThread Transport ──> UART
+        ├── OpenThread Transport ──> UART                  <─── SET TO THIS VALUE
         └── (configure UART parameters)
 ```
 
@@ -131,23 +131,23 @@ If you did not edit `sdkconfig.defaults.esp32c6` to enable OpenThread (above), m
 ```
 Component config
 ├── Wireless Coexistence
-│   └── [*] Software controls WiFi/Bluetooth coexistence
+│   └── [*] Software controls WiFi/Bluetooth coexistence   <─── ENABLE
 └── OpenThread
-    ├── [*] OpenThread
+    ├── [*] OpenThread                                     <─── ENABLE
     ├── Thread Task Parameters
-    │   └── (3072) Size of OpenThread task
+    │   └── (3072) Size of OpenThread task                 <─── SET TO THIS VALUE
     ├── Thread Console
-    │   ├── [ ] Enable OpenThread console
-    │   └── [ ] Enable Openthread Command-Line Interface
+    │   ├── [ ] Enable OpenThread console                  <─── DISABLE
+    │   └── [ ] Enable Openthread Command-Line Interface   <─── DISABLE
     ├── Thread Core Features
-    │   ├── Thread device type ──> Radio Only Device
-    │   ├── [ ] Enable Commissioner
-    │   ├── [ ] Enable Joiner
-    │   ├── [ ] Enable SRP Client
-    │   ├── [ ] Enable DNS Client
-    │   ├── [ ] Enable diag Client
+    │   ├── Thread device type ──> Radio Only Device       <─── SET TO THIS VALUE
+    │   ├── [ ] Enable Commissioner                        <─── DISABLE
+    │   ├── [ ] Enable Joiner                              <─── DISABLE
+    │   ├── [ ] Enable SRP Client                          <─── DISABLE
+    │   ├── [ ] Enable DNS Client                          <─── DISABLE
+    │   ├── [ ] Enable diag Client                         <─── DISABLE
     └── Thread Log
-        └── [ ] Enable dynamic log level control
+        └── [ ] Enable dynamic log level control           <─── DISABLE
 ```
 
 You can now build the co-processor as an RCP.

@@ -22,10 +22,19 @@
 #include "pedestrian_detect.hpp"
 #include "led_controller.h"
 
+#ifndef CONFIG_HUMAN_DETECT_LEAVE_REMINDER_MS
+#define CONFIG_HUMAN_DETECT_LEAVE_REMINDER_MS 60000
+#endif
+
 static const char *TAG = "human_detect";
 
 static SemaphoreHandle_t s_state_mutex = nullptr;
 static TaskHandle_t s_task_handle = nullptr;
+
+/* Allocate the detection task stack from PSRAM to avoid exhausting internal
+ * RAM after audio/LVGL allocations. */
+static StaticTask_t s_human_detect_tcb;
+static StackType_t *s_human_detect_stack = nullptr;
 
 static PedestrianDetect *s_detector = nullptr;
 static human_frame_reader_t s_frame_reader = nullptr;
@@ -42,6 +51,10 @@ static uint32_t s_last_seen_ms = 0;
 static uint32_t s_present_since_ms = 0;
 static int s_present_streak = 0;
 static human_left_callback_t s_left_cb = nullptr;
+static human_present_callback_t s_present_cb = nullptr;
+static human_left_reminder_callback_t s_reminder_cb = nullptr;
+static bool s_reminder_armed = false;
+static uint32_t s_left_at_ms = 0;
 
 static uint32_t now_ms(void)
 {
@@ -88,6 +101,9 @@ static void update_presence(bool detected, uint32_t now)
     bool present_after_update = false;
     uint32_t left_duration_ms = 0;
     human_left_callback_t left_cb = nullptr;
+    human_present_callback_t present_cb = nullptr;
+    bool fire_reminder = false;
+    uint32_t absent_ms = 0;
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
 
@@ -96,30 +112,54 @@ static void update_presence(bool detected, uint32_t now)
         s_last_seen_ms = now;
         if (!s_present && s_present_streak >= CONFIG_HUMAN_DETECT_ENTER_CONFIRM_FRAMES) {
             changed = set_present_locked(true, now, nullptr, nullptr);
+            if (changed) {
+                s_reminder_armed = false;
+                present_cb = s_present_cb;
+            }
         }
     } else {
         s_present_streak = 0;
         if (s_present && s_last_seen_ms > 0 && now - s_last_seen_ms >= s_leave_timeout_ms) {
             changed = set_present_locked(false, now, &left_duration_ms, &left_cb);
+            if (changed) {
+                s_left_at_ms = now;
+                s_reminder_armed = (s_reminder_cb != nullptr);
+            }
         }
     }
     present_after_update = s_present;
 
+    /* One-shot reminder while the person remains absent. */
+    if (!present_after_update && s_reminder_armed && s_reminder_cb != nullptr &&
+        now - s_left_at_ms >= CONFIG_HUMAN_DETECT_LEAVE_REMINDER_MS) {
+        fire_reminder = true;
+        absent_ms = now - s_left_at_ms;
+        s_reminder_armed = false; /* fire only once per absence */
+    }
+
     xSemaphoreGive(s_state_mutex);
 
-    if (!changed) {
+    if (!changed && !fire_reminder) {
         return;
     }
 
 #if CONFIG_HUMAN_DETECT_LED_AUTO_CONTROL
-    if (present_after_update) {
-        led_turn_on();
-    } else {
-        led_turn_off();
+    if (changed) {
+        if (present_after_update) {
+            led_turn_on();
+        } else {
+            led_turn_off();
+        }
     }
 #endif
-    if (!present_after_update && left_cb != nullptr) {
+    if (changed && !present_after_update && left_cb != nullptr) {
         left_cb(left_duration_ms);
+    }
+    if (changed && present_after_update && present_cb != nullptr) {
+        present_cb();
+    }
+    if (fire_reminder && s_reminder_cb != nullptr) {
+        s_reminder_cb(absent_ms);
     }
 }
 
@@ -243,7 +283,11 @@ int human_detect_register_frame_reader(human_frame_reader_t reader,
     }
 
     const size_t frame_len = (size_t)width * (size_t)height * 2U;
-    uint8_t *new_frame = (uint8_t *)heap_caps_malloc(frame_len, MALLOC_CAP_SPIRAM);
+    /* Keep the frame copy 16-byte aligned for cache efficiency.  The SIMD
+     * image-preprocessing path in esp-dl has been disabled for ESP32-P4 because
+     * it crashes when reading from PSRAM, so this buffer only needs to be
+     * CPU-accessible. */
+    uint8_t *new_frame = (uint8_t *)heap_caps_aligned_alloc(16, frame_len, MALLOC_CAP_SPIRAM);
     if (new_frame == nullptr) {
         ESP_LOGE(TAG, "failed to allocate frame copy buffer, len=%zu", frame_len);
         return ESP_ERR_NO_MEM;
@@ -278,14 +322,23 @@ int human_detect_start(void)
         return ESP_OK;
     }
 
-    BaseType_t ret = xTaskCreate(human_detect_task,
-                                 "human_detect",
-                                 CONFIG_HUMAN_DETECT_TASK_STACK_SIZE,
-                                 nullptr,
-                                 CONFIG_HUMAN_DETECT_TASK_PRIORITY,
-                                 &s_task_handle);
-    if (ret != pdPASS) {
-        s_task_handle = nullptr;
+    const uint32_t stack_bytes = CONFIG_HUMAN_DETECT_TASK_STACK_SIZE;
+    s_human_detect_stack = (StackType_t *)heap_caps_malloc(stack_bytes, MALLOC_CAP_SPIRAM);
+    if (s_human_detect_stack == nullptr) {
+        ESP_LOGE(TAG, "failed to allocate human_detect task stack from PSRAM, len=%" PRIu32, stack_bytes);
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_task_handle = xTaskCreateStatic(human_detect_task,
+                                      "human_detect",
+                                      stack_bytes / sizeof(StackType_t),
+                                      nullptr,
+                                      CONFIG_HUMAN_DETECT_TASK_PRIORITY,
+                                      s_human_detect_stack,
+                                      &s_human_detect_tcb);
+    if (s_task_handle == nullptr) {
+        heap_caps_free(s_human_detect_stack);
+        s_human_detect_stack = nullptr;
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -322,5 +375,27 @@ void human_register_left_callback(human_left_callback_t cb)
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     s_left_cb = cb;
+    xSemaphoreGive(s_state_mutex);
+}
+
+void human_register_present_callback(human_present_callback_t cb)
+{
+    if (s_state_mutex == nullptr) {
+        return;
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_present_cb = cb;
+    xSemaphoreGive(s_state_mutex);
+}
+
+void human_register_left_reminder_callback(human_left_reminder_callback_t cb)
+{
+    if (s_state_mutex == nullptr) {
+        return;
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_reminder_cb = cb;
     xSemaphoreGive(s_state_mutex);
 }

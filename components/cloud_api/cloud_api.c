@@ -7,11 +7,14 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "esp_random.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "cJSON.h"
@@ -488,6 +491,221 @@ static esp_err_t baidu_tts(const char *text, int16_t **pcm_out, size_t *sample_c
 }
 
 /* -------------------------------------------------------------------------- */
+/* Doubao (Volcano Engine) TTS                                                */
+/* -------------------------------------------------------------------------- */
+
+static void generate_reqid(char *buf, size_t len)
+{
+    uint32_t r[4];
+    for (int i = 0; i < 4; i++) {
+        r[i] = esp_random();
+    }
+    snprintf(buf, len, "%08x-%04x-%04x-%04x-%04x%08x",
+             (unsigned int)r[0],
+             (unsigned int)(r[1] & 0xFFFF), (unsigned int)((r[1] >> 16) & 0xFFFF),
+             (unsigned int)(r[2] & 0xFFFF), (unsigned int)((r[2] >> 16) & 0xFFFF),
+             (unsigned int)r[3]);
+}
+
+static esp_err_t doubao_tts(const char *text,
+                            int16_t **pcm_out, size_t *sample_count_out)
+{
+    if (text == NULL || pcm_out == NULL || sample_count_out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (CONFIG_CLOUD_API_DOUBAO_TTS_APPID[0] == '\0' ||
+        CONFIG_CLOUD_API_DOUBAO_TTS_TOKEN[0] == '\0' ||
+        CONFIG_CLOUD_API_DOUBAO_TTS_CLUSTER[0] == '\0') {
+        ESP_LOGE(TAG, "Doubao TTS appid/token/cluster not configured");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char reqid[40];
+    generate_reqid(reqid, sizeof(reqid));
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *app = cJSON_CreateObject();
+    cJSON_AddStringToObject(app, "appid", CONFIG_CLOUD_API_DOUBAO_TTS_APPID);
+    cJSON_AddStringToObject(app, "token", "access_token");
+    cJSON_AddStringToObject(app, "cluster", CONFIG_CLOUD_API_DOUBAO_TTS_CLUSTER);
+    cJSON_AddItemToObject(root, "app", app);
+
+    cJSON *user = cJSON_CreateObject();
+    cJSON_AddStringToObject(user, "uid", CONFIG_CLOUD_API_BAIDU_CUID);
+    cJSON_AddItemToObject(root, "user", user);
+
+    cJSON *audio = cJSON_CreateObject();
+    cJSON_AddStringToObject(audio, "voice_type", CONFIG_CLOUD_API_DOUBAO_TTS_VOICE);
+    cJSON_AddStringToObject(audio, "encoding", "pcm");
+    cJSON_AddNumberToObject(audio, "rate", CONFIG_CLOUD_API_DOUBAO_TTS_RATE);
+    cJSON_AddNumberToObject(audio, "speed_ratio", 1.0);
+    cJSON_AddNumberToObject(audio, "volume_ratio", 1.0);
+    cJSON_AddItemToObject(root, "audio", audio);
+
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddStringToObject(req, "reqid", reqid);
+    cJSON_AddStringToObject(req, "text", text);
+    cJSON_AddStringToObject(req, "text_type", "plain");
+    cJSON_AddStringToObject(req, "operation", "query");
+    cJSON_AddItemToObject(root, "request", req);
+
+    char *body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (body == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    char auth_header[128];
+    snprintf(auth_header, sizeof(auth_header), "Bearer;%s", CONFIG_CLOUD_API_DOUBAO_TTS_TOKEN);
+
+    /* The http_request helper sets Accept from accept_type, but it does not
+     * have a dedicated Authorization header argument. Add it via the extra
+     * header hook by constructing the client config ourselves is overkill;
+     * instead we use esp_http_client directly for this single call. */
+    esp_http_client_config_t config = {
+        .url = "https://openspeech.bytedance.com/api/v1/tts",
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 30000,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .user_agent = "curl/8.0.0",
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        free(body);
+        return ESP_FAIL;
+    }
+    esp_http_client_set_header(client, "Authorization", auth_header);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "Accept", "application/json");
+
+    size_t body_len = strlen(body);
+    esp_err_t err = esp_http_client_open(client, (int)body_len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Doubao TTS HTTP open failed: %s", esp_err_to_name(err));
+        free(body);
+        esp_http_client_cleanup(client);
+        return err;
+    }
+
+    int wret = esp_http_client_write(client, body, (int)body_len);
+    free(body);
+    if (wret != (int)body_len) {
+        ESP_LOGE(TAG, "Doubao TTS HTTP write failed: %d/%zu", wret, body_len);
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
+    }
+
+    int64_t content_length = esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    ESP_LOGI(TAG, "Doubao TTS status=%d, len=%lld", status, (long long)content_length);
+
+    if (status != 200) {
+        ESP_LOGE(TAG, "Doubao TTS HTTP error status=%d", status);
+        char err_buf[512];
+        int err_read = esp_http_client_read(client, err_buf, sizeof(err_buf) - 1);
+        if (err_read > 0) {
+            err_buf[err_read] = '\0';
+            ESP_LOGE(TAG, "Doubao TTS error response: %s", err_buf);
+        }
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
+    }
+
+    int read_len = content_length > 0 ? (int)content_length : 4096;
+    char *resp = (char *)malloc(read_len + 1);
+    if (resp == NULL) {
+        esp_http_client_cleanup(client);
+        return ESP_ERR_NO_MEM;
+    }
+
+    int total_read = 0;
+    int r = 0;
+    while (total_read < read_len) {
+        r = esp_http_client_read(client, resp + total_read, read_len - total_read);
+        if (r <= 0) {
+            break;
+        }
+        total_read += r;
+        if (total_read >= read_len && content_length <= 0) {
+            read_len *= 2;
+            char *tmp = realloc(resp, read_len + 1);
+            if (tmp == NULL) {
+                ESP_LOGE(TAG, "failed to grow Doubao TTS response buffer");
+                free(resp);
+                esp_http_client_cleanup(client);
+                return ESP_ERR_NO_MEM;
+            }
+            resp = tmp;
+        }
+    }
+    resp[total_read] = '\0';
+    esp_http_client_cleanup(client);
+
+    cJSON *resp_json = cJSON_Parse(resp);
+    if (resp_json == NULL) {
+        ESP_LOGE(TAG, "Doubao TTS response is not valid JSON");
+        free(resp);
+        return ESP_FAIL;
+    }
+
+    cJSON *code_item = cJSON_GetObjectItem(resp_json, "code");
+    if (code_item != NULL && cJSON_IsNumber(code_item) && code_item->valueint != 0) {
+        cJSON *msg_item = cJSON_GetObjectItem(resp_json, "message");
+        ESP_LOGE(TAG, "Doubao TTS error: code=%d, message=%s",
+                 code_item->valueint,
+                 msg_item && cJSON_IsString(msg_item) ? msg_item->valuestring : "(none)");
+        cJSON_Delete(resp_json);
+        free(resp);
+        return ESP_FAIL;
+    }
+
+    cJSON *data_item = cJSON_GetObjectItem(resp_json, "data");
+    if (data_item == NULL || !cJSON_IsString(data_item)) {
+        ESP_LOGE(TAG, "Doubao TTS response missing data field");
+        cJSON_Delete(resp_json);
+        free(resp);
+        return ESP_FAIL;
+    }
+
+    const char *b64 = data_item->valuestring;
+    size_t b64_len = strlen(b64);
+    size_t pcm_len = 0;
+    mbedtls_base64_decode(NULL, 0, &pcm_len, (const unsigned char *)b64, b64_len);
+    if (pcm_len == 0) {
+        ESP_LOGE(TAG, "Doubao TTS returned empty audio");
+        cJSON_Delete(resp_json);
+        free(resp);
+        return ESP_FAIL;
+    }
+
+    int16_t *pcm = (int16_t *)heap_caps_malloc(pcm_len, MALLOC_CAP_SPIRAM);
+    if (pcm == NULL) {
+        cJSON_Delete(resp_json);
+        free(resp);
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t decoded_len = 0;
+    int bret = mbedtls_base64_decode((unsigned char *)pcm, pcm_len, &decoded_len,
+                                     (const unsigned char *)b64, b64_len);
+    cJSON_Delete(resp_json);
+    free(resp);
+    if (bret != 0 || decoded_len != pcm_len) {
+        ESP_LOGE(TAG, "Doubao TTS base64 decode failed: ret=%d decoded=%zu expected=%zu",
+                 bret, decoded_len, pcm_len);
+        heap_caps_free(pcm);
+        return ESP_FAIL;
+    }
+
+    *pcm_out = pcm;
+    *sample_count_out = decoded_len / sizeof(int16_t);
+    ESP_LOGI(TAG, "Doubao TTS OK, samples=%zu", *sample_count_out);
+    return ESP_OK;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Volcano Engine (Ark) VLM                                                   */
 /* -------------------------------------------------------------------------- */
 
@@ -684,7 +902,7 @@ static esp_err_t volcano_vlm_ask(const char *question,
     cJSON_AddItemToObject(msg, "content", content);
     cJSON_AddItemToArray(messages, msg);
     cJSON_AddItemToObject(root, "messages", messages);
-    cJSON_AddNumberToObject(root, "max_tokens", 80);
+    cJSON_AddNumberToObject(root, "max_tokens", CONFIG_CLOUD_API_LLM_MAX_TOKENS);
 
     char *body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -913,7 +1131,7 @@ static esp_err_t volcano_vlm_ask_with_reference(const char *question,
     cJSON_AddItemToObject(msg, "content", content);
     cJSON_AddItemToArray(messages, msg);
     cJSON_AddItemToObject(root, "messages", messages);
-    cJSON_AddNumberToObject(root, "max_tokens", 80);
+    cJSON_AddNumberToObject(root, "max_tokens", CONFIG_CLOUD_API_LLM_MAX_TOKENS);
 
     char *body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -1177,7 +1395,7 @@ esp_err_t cloud_tts_speak(const char *text,
     return ESP_OK;
 #else
     /* Limit TTS input length to keep response short and avoid huge buffers. */
-    const size_t max_tts_chars = 80;
+    const size_t max_tts_chars = CONFIG_CLOUD_API_TTS_MAX_CHARS;
     char *truncated = utf8_truncate(text, max_tts_chars);
     if (truncated == NULL) {
         return ESP_ERR_NO_MEM;
@@ -1186,9 +1404,31 @@ esp_err_t cloud_tts_speak(const char *text,
         ESP_LOGW(TAG, "TTS input truncated to %zu chars", max_tts_chars);
     }
     ESP_LOGI(TAG, "TTS text: %s", truncated);
+#if CONFIG_CLOUD_API_TTS_PROVIDER_DOUBAO
+    esp_err_t err = doubao_tts(truncated, pcm_out, sample_count_out);
+#else
     esp_err_t err = baidu_tts(truncated, pcm_out, sample_count_out);
+#endif
     free(truncated);
-    return err;
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* Scale output amplitude by configured volume (0-200%). */
+    const float volume = CONFIG_CLOUD_API_VOLCANO_TTS_VOLUME / 100.0f;
+    if (volume != 1.0f && *pcm_out != NULL && *sample_count_out > 0) {
+        int16_t *pcm = *pcm_out;
+        for (size_t i = 0; i < *sample_count_out; i++) {
+            int32_t sample = (int32_t)((float)pcm[i] * volume);
+            if (sample > INT16_MAX) {
+                sample = INT16_MAX;
+            } else if (sample < INT16_MIN) {
+                sample = INT16_MIN;
+            }
+            pcm[i] = (int16_t)sample;
+        }
+    }
+    return ESP_OK;
 #endif
 }
 

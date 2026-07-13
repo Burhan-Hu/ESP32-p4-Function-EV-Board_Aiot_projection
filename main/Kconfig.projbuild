@@ -43,6 +43,14 @@ menu "Example Configuration"
         bool
         default y
 
+    config ISP_AWB_ONESHOT_ENABLE
+        bool "Enable one-shot ISP AWB on first frame"
+        default y
+        help
+            Capture AWB statistics from the first processed frame and derive
+            a color-correction matrix (CCM) to neutralise the greenish tint
+            from the SC2336 sensor.
+
     choice EXAMPLE_MIPI_CSI_DISP_HRES
         bool "Set MIPI CSI horizontal resolution"
         default EXAMPLE_MIPI_CSI_HRES_1024
