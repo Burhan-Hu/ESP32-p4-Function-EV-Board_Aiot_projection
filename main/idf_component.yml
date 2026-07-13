@@ -13,3 +13,6 @@ dependencies:
     version: "~1.5"
   espressif/esp-sr:
     version: ">=1.9.0"
+  lvgl/lvgl:
+    version: "^9"
+    public: true

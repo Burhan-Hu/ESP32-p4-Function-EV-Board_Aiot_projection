@@ -20,6 +20,8 @@
 #include "esp_heap_caps.h"
 #include "driver/i2c_master.h"
 #include "driver/isp.h"
+#include "driver/isp_awb.h"
+#include "driver/isp_ccm.h"
 #include "esp_cam_ctlr_csi.h"
 #include "esp_cam_ctlr.h"
 #include "example_dsi_init.h"
@@ -34,6 +36,8 @@
 #include "pir.h"
 #include "camera_capture.h"
 #include "human_detect.h"
+#include "ui_manager.h"
+#include "ui_lvgl.h"
 #if CONFIG_WAKE_WORD_ENABLED
 #include "wake_word.h"
 #endif
@@ -44,8 +48,11 @@ static esp_cam_ctlr_handle_t s_cam_handle = NULL;
 static int s_cam_width = 0;
 static int s_cam_height = 0;
 static void *s_frame_buffer = NULL;
+static void *s_cam_buffer = NULL;
+static void *s_display_buffer = NULL;
 static size_t s_frame_buffer_size = 0;
 static SemaphoreHandle_t s_cam_capture_mutex = NULL;
+static ui_model_t s_ui_model;
 
 /* -------------------------------------------------------------------------- */
 /* Continuous monitoring state machine                                        */
@@ -164,6 +171,8 @@ static void run_vlm_tts_pipeline(const char *question, const uint8_t *jpeg_data,
 static bool question_needs_camera(const char *text);
 static bool app_human_frame_reader(uint8_t *dst, size_t dst_len, int *width, int *height, void *ctx);
 static void on_human_left(uint32_t duration_ms);
+static void on_human_present(void);
+static void on_human_left_reminder(uint32_t absent_ms);
 
 /* Return true if the user question likely requires visual information. */
 static bool question_needs_camera(const char *text)
@@ -213,6 +222,24 @@ static void run_vlm_tts_pipeline(const char *question, const uint8_t *jpeg_data,
     cloud_pcm_free(tts_pcm);
 }
 
+static void speak_text(const char *text)
+{
+    if (text == NULL) {
+        return;
+    }
+
+    int16_t *tts_pcm = NULL;
+    size_t tts_samples = 0;
+    esp_err_t ret = cloud_tts_speak(text, &tts_pcm, &tts_samples);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "TTS failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "TTS playing: %s", text);
+    audio_play_pcm(tts_pcm, tts_samples);
+    cloud_pcm_free(tts_pcm);
+}
+
 static bool app_human_frame_reader(uint8_t *dst, size_t dst_len, int *width, int *height, void *ctx)
 {
     (void)ctx;
@@ -243,6 +270,36 @@ static bool app_human_frame_reader(uint8_t *dst, size_t dst_len, int *width, int
 static void on_human_left(uint32_t duration_ms)
 {
     ESP_LOGI(TAG, "human left callback, presence_duration=%" PRIu32 " ms", duration_ms);
+
+    s_ui_model.seat_state = "离座";
+    s_ui_model.event_duration_seconds = duration_ms / 1000;
+    ui_manager_update(&s_ui_model);
+
+    ui_event_t leave_event = {
+        .type = UI_EVENT_LEAVE_SEAT,
+        .confidence = 80,
+        .risk_level = 1,
+        .duration_seconds = duration_ms / 1000,
+        .timestamp_seconds = duration_ms / 1000,
+    };
+    ui_manager_push_event(&leave_event);
+}
+
+static void on_human_present(void)
+{
+    ESP_LOGI(TAG, "human present callback");
+
+    s_ui_model.seat_state = "在座";
+    ui_manager_update(&s_ui_model);
+
+    /* Roll back from a soft-alert / review state to the normal focus overlay. */
+    ui_manager_clear_event();
+}
+
+static void on_human_left_reminder(uint32_t absent_ms)
+{
+    ESP_LOGI(TAG, "human left reminder, absent_ms=%" PRIu32, absent_ms);
+    speak_text("你已经离开座位一分钟了，回来我们继续学习吧。");
 }
 #if CONFIG_WAKE_WORD_ENABLED
 static void on_wake_word_detected(void)
@@ -471,6 +528,122 @@ static void on_pir_motion_detected(void)
 }
 #endif
 
+#if CONFIG_ISP_AWB_ONESHOT_ENABLE
+/**
+ * @brief One-shot auto white balance using ISP AWB statistics + CCM.
+ *
+ * The SC2336 on the ESP32-P4 Function EV board tends to produce a greenish
+ * image with the default ISP pipeline.  We sample the white patches from the
+ * first processed frame, compute the average R/G and B/G ratios, and apply a
+ * diagonal color-correction matrix to neutralise the cast.
+ */
+static esp_err_t isp_apply_awb_ccm(isp_proc_handle_t isp_proc)
+{
+    isp_awb_ctlr_t awb_ctlr = NULL;
+    int w = CONFIG_EXAMPLE_MIPI_CSI_DISP_HRES;
+    int h = CONFIG_EXAMPLE_MIPI_CSI_DISP_VRES;
+
+    esp_isp_awb_config_t awb_cfg = {
+        .sample_point = ISP_AWB_SAMPLE_POINT_AFTER_CCM,
+        .window = {
+            .top_left  = { .x = (uint32_t)(w * 0.2f), .y = (uint32_t)(h * 0.2f) },
+            .btm_right = { .x = (uint32_t)(w * 0.8f), .y = (uint32_t)(h * 0.8f) },
+        },
+        .white_patch = {
+            .luminance = { .min = 0, .max = 220 * 3 },
+            .red_green_ratio  = { .min = 0.0f, .max = 3.999f },
+            .blue_green_ratio = { .min = 0.0f, .max = 3.999f },
+        },
+    };
+
+    esp_err_t ret = esp_isp_new_awb_controller(isp_proc, &awb_cfg, &awb_ctlr);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "AWB controller creation failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = esp_isp_awb_controller_enable(awb_ctlr);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "AWB controller enable failed: %s", esp_err_to_name(ret));
+        goto del_awb;
+    }
+
+    isp_awb_stat_result_t stat = {};
+    ret = esp_isp_awb_controller_get_oneshot_statistics(awb_ctlr, 2000, &stat);
+    if (ret == ESP_OK && stat.white_patch_num > 0) {
+        float n = (float)stat.white_patch_num;
+        float avg_r = stat.sum_r / n;
+        float avg_g = stat.sum_g / n;
+        float avg_b = stat.sum_b / n;
+
+        float r_gain = (avg_g > 0.0f) ? (avg_g / avg_r) : 1.0f;
+        float b_gain = (avg_g > 0.0f) ? (avg_g / avg_b) : 1.0f;
+
+        if (r_gain < 0.25f) r_gain = 0.25f;
+        if (r_gain > 4.0f)  r_gain = 4.0f;
+        if (b_gain < 0.25f) b_gain = 0.25f;
+        if (b_gain > 4.0f)  b_gain = 4.0f;
+
+        esp_isp_ccm_config_t ccm = {
+            .matrix = {
+                { r_gain, 0.0f, 0.0f },
+                { 0.0f,   1.0f, 0.0f },
+                { 0.0f,   0.0f, b_gain }
+            },
+            .saturation = true,
+        };
+
+        ESP_LOGI(TAG, "AWB stats: patches=%" PRIu32 " avg(R,G,B)=(%.2f,%.2f,%.2f) -> CCM(R,B)=(%.3f,%.3f)",
+                 stat.white_patch_num, avg_r, avg_g, avg_b, r_gain, b_gain);
+
+        ret = esp_isp_ccm_configure(isp_proc, &ccm);
+        if (ret == ESP_OK) {
+            ret = esp_isp_ccm_enable(isp_proc);
+        }
+    } else {
+        ESP_LOGW(TAG, "AWB stats unavailable (%s) or no white patches (%" PRIu32 "), using fallback CCM",
+                 esp_err_to_name(ret), stat.white_patch_num);
+        esp_isp_ccm_config_t ccm = {
+            .matrix = {
+                { 1.15f, 0.08f, 0.0f },
+                { 0.0f,  0.88f, 0.0f },
+                { 0.0f,  0.08f, 1.15f }
+            },
+            .saturation = true,
+        };
+        esp_isp_ccm_configure(isp_proc, &ccm);
+        esp_isp_ccm_enable(isp_proc);
+        ret = ESP_OK;
+    }
+
+    esp_isp_awb_controller_disable(awb_ctlr);
+del_awb:
+    esp_isp_del_awb_controller(awb_ctlr);
+    return ret;
+}
+#endif /* CONFIG_ISP_AWB_ONESHOT_ENABLE */
+
+static esp_err_t isp_apply_color_correction(isp_proc_handle_t isp_proc)
+{
+#if CONFIG_ISP_AWB_ONESHOT_ENABLE
+    return isp_apply_awb_ccm(isp_proc);
+#else
+    esp_isp_ccm_config_t ccm = {
+        .matrix = {
+            { 1.15f, 0.08f, 0.0f },
+            { 0.0f,  0.88f, 0.0f },
+            { 0.0f,  0.08f, 1.15f }
+        },
+        .saturation = true,
+    };
+    esp_err_t ret = esp_isp_ccm_configure(isp_proc, &ccm);
+    if (ret == ESP_OK) {
+        ret = esp_isp_ccm_enable(isp_proc);
+    }
+    return ret;
+#endif
+}
+
 void app_main(void)
 {
     esp_err_t ret = ESP_FAIL;
@@ -486,6 +659,29 @@ void app_main(void)
     } else {
         http_test_request();
     }
+
+    //---------------UI Overlay Init------------------//
+    ui_manager_init();
+    s_ui_model = (ui_model_t){
+        .wifi_connected = (ret == ESP_OK),
+        .camera_ok = false,
+        .privacy_on = false,
+        .learn_score = 86,
+        .risk_level = 1,
+        .seat_state = "检测中",
+        .screen_state = "等待课程开始",
+        .pose_state = "检测中",
+        .event_type = "学习状态提醒",
+        .event_message = "准备好后就可以开始学习。",
+        .summary_title = "今日课程",
+        .summary_text = "1. 等待课程内容同步\n2. 准备进入专注守护",
+        .study_seconds = 0,
+        .event_duration_seconds = 0,
+        .homework_text = "暂无作业提醒",
+        .course_title = "智能伴学课程",
+    };
+    ui_manager_update(&s_ui_model);
+    ui_manager_show_page(UI_PAGE_IDLE);
 
     esp_lcd_dsi_bus_handle_t mipi_dsi_bus = NULL;
     esp_lcd_panel_io_handle_t mipi_dbi_io = NULL;
@@ -513,18 +709,27 @@ void app_main(void)
 #else
     example_dsi_resource_alloc(&mipi_dsi_bus, &mipi_dbi_io, &mipi_dpi_panel, &frame_buffer);
 #endif
-    s_frame_buffer = frame_buffer;
-
-    //---------------Necessary variable config------------------//
+    /* The DSI panel buffer is what the DPI controller scans out to the LCD.
+     * We keep it as the LVGL render/display buffer.  The camera/ISP output is
+     * redirected into a separate PSRAM buffer so the UI overlay can be
+     * composited on top without being overwritten by the next frame. */
+    s_display_buffer = frame_buffer;
     frame_buffer_size = CONFIG_EXAMPLE_MIPI_CSI_DISP_HRES * CONFIG_EXAMPLE_MIPI_DSI_DISP_VRES * EXAMPLE_RGB565_BITS_PER_PIXEL / 8;
-
     s_frame_buffer_size = frame_buffer_size;
-    ESP_LOGD(TAG, "CONFIG_EXAMPLE_MIPI_CSI_DISP_HRES: %d, CONFIG_EXAMPLE_MIPI_DSI_DISP_VRES: %d, bits per pixel: %d", CONFIG_EXAMPLE_MIPI_CSI_DISP_HRES, CONFIG_EXAMPLE_MIPI_DSI_DISP_VRES, EXAMPLE_RGB565_BITS_PER_PIXEL);
-    ESP_LOGD(TAG, "frame_buffer_size: %zu", frame_buffer_size);
-    ESP_LOGD(TAG, "frame_buffer: %p", frame_buffer);
+
+    s_cam_buffer = heap_caps_aligned_alloc(64, frame_buffer_size,
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    if (s_cam_buffer == NULL) {
+        ESP_LOGE(TAG, "failed to allocate camera frame buffer (len=%zu)", frame_buffer_size);
+        return;
+    }
+    s_frame_buffer = s_cam_buffer;
+    memset(s_cam_buffer, 0x00, frame_buffer_size);
+    esp_cache_msync(s_cam_buffer, frame_buffer_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    ESP_LOGD(TAG, "display_buffer=%p camera_buffer=%p size=%zu", frame_buffer, s_cam_buffer, frame_buffer_size);
 
     esp_cam_ctlr_trans_t new_trans = {
-        .buffer = frame_buffer,
+        .buffer = s_cam_buffer,
         .buflen = frame_buffer_size,
     };
 
@@ -542,6 +747,9 @@ void app_main(void)
     };
     example_sensor_init(&cam_sensor_config, &sensor_handle);
     ESP_LOGI(TAG, "sensor init done");
+
+    s_ui_model.camera_ok = true;
+    ui_manager_update(&s_ui_model);
 
     //---------------Audio Init------------------//
     ret = audio_init(sensor_handle.i2c_bus_handle);
@@ -659,9 +867,28 @@ void app_main(void)
         return;
     }
     ESP_LOGI(TAG, "first frame received, entering idle loop");
+
+    //---------------ISP Color Correction------------------//
+    ret = isp_apply_color_correction(isp_proc);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "ISP color correction failed: %s", esp_err_to_name(ret));
+    }
+
+    //---------------LVGL Overlay------------------//
+#if CONFIG_UI_MANAGER_USE_LVGL
+    if (s_display_buffer && s_cam_buffer) {
+        ui_lvgl_init(s_display_buffer, s_cam_buffer, s_cam_width, s_cam_height);
+        ESP_LOGI(TAG, "LVGL overlay initialised");
+        /* Sync the current UI model into the overlay now that it is ready. */
+        ui_manager_update(&s_ui_model);
+    }
+#endif
+
     ret = human_detect_init();
     if (ret == ESP_OK) {
         human_register_left_callback(on_human_left);
+        human_register_present_callback(on_human_present);
+        human_register_left_reminder_callback(on_human_left_reminder);
         ret = human_detect_register_frame_reader(app_human_frame_reader, NULL, s_cam_width, s_cam_height);
         if (ret == ESP_OK) {
             ret = human_detect_start();
@@ -733,5 +960,7 @@ static bool s_camera_get_new_vb(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans
 
 static bool s_camera_get_finished_trans(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data)
 {
-    return false;
+    BaseType_t woken = pdFALSE;
+    ui_lvgl_notify_frame_ready(&woken);
+    return woken == pdTRUE;
 }

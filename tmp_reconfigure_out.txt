@@ -1,0 +1,4 @@
+Microsoft Windows [版本 10.0.26200.8246]
+(c) Microsoft Corporation。保留所有权利。
+
+E:\Tools\ESP-IDF\Espressif\frameworks\esp-idf-v5.5.2\esp_workspace\aiot_agent>

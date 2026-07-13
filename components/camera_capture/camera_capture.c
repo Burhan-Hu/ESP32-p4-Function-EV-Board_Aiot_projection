@@ -13,6 +13,7 @@
 #include "esp_cache.h"
 #include "esp_heap_caps.h"
 #include "driver/jpeg_encode.h"
+#include "driver/jpeg_types.h"
 #include "camera_capture.h"
 
 static const char *TAG = "camera_capture";
@@ -56,15 +57,23 @@ esp_err_t camera_capture_init(int width, int height)
         s_jpeg_buf = NULL;
     }
 
-    /* Keep capture buffers in PSRAM to preserve internal RAM. */
-    s_rgb_buf = (uint8_t *)heap_caps_malloc(s_rgb_buf_size, MALLOC_CAP_SPIRAM);
+    /* Keep capture buffers in PSRAM to preserve internal RAM.
+     * Use jpeg_alloc_encoder_mem() so that the JPEG engine's alignment
+     * requirements (cache-line alignment for the output bit-stream) are met. */
+    jpeg_encode_memory_alloc_cfg_t input_mem_cfg = {
+        .buffer_direction = JPEG_ENC_ALLOC_INPUT_BUFFER,
+    };
+    s_rgb_buf = (uint8_t *)jpeg_alloc_encoder_mem(s_rgb_buf_size, &input_mem_cfg, &s_rgb_buf_size);
     if (s_rgb_buf == NULL) {
         ESP_LOGE(TAG, "failed to pre-allocate RGB565 capture buffer");
         xSemaphoreGive(s_capture_mutex);
         return ESP_ERR_NO_MEM;
     }
 
-    s_jpeg_buf = (uint8_t *)heap_caps_malloc(s_jpeg_buf_size, MALLOC_CAP_SPIRAM);
+    jpeg_encode_memory_alloc_cfg_t output_mem_cfg = {
+        .buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER,
+    };
+    s_jpeg_buf = (uint8_t *)jpeg_alloc_encoder_mem(s_jpeg_buf_size, &output_mem_cfg, &s_jpeg_buf_size);
     if (s_jpeg_buf == NULL) {
         ESP_LOGE(TAG, "failed to pre-allocate JPEG capture buffer");
         heap_caps_free(s_rgb_buf);

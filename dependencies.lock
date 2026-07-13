@@ -32,15 +32,15 @@ dependencies:
       type: service
     version: 0.5.3
   espressif/dl_fft:
-    component_hash: 2f319e72f3ab6f673c83849d6a14b68c21165d4dce24e12af7c13714ba35a6e0
+    component_hash: a955ca29581de2177ddf25759273bd83f082b3c805e735fe6ee105858643989b
     dependencies:
     - name: idf
       require: private
       version: '>=5.0'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
-    version: 0.5.0
+    version: 0.6.0
   espressif/eppp_link:
     component_hash: 04f7f31868b8ae6014c96132740a192d09611a6e46aaa7038c865ffc7e26b38f
     dependencies:
@@ -56,32 +56,10 @@ dependencies:
       type: service
     version: 1.1.5
   espressif/esp-dl:
-    component_hash: d6f5f960bc1e6af82cd9b064bdf674b78128d003168043d08137f5be2bb22014
-    dependencies:
-    - name: espressif/dl_fft
-      registry_url: https://components.espressif.com
-      require: private
-      version: '>=0.4.0'
-    - name: espressif/esp_new_jpeg
-      registry_url: https://components.espressif.com
-      require: private
-      version: ^1
-    - name: idf
-      require: private
-      version: '*'
+    dependencies: []
     source:
-      registry_url: https://components.espressif.com
-      type: service
-    targets:
-    - esp32
-    - esp32c2
-    - esp32c3
-    - esp32c5
-    - esp32c6
-    - esp32p4
-    - esp32s2
-    - esp32s3
-    - esp32s31
+      path: E:\Tools\ESP-IDF\Espressif\frameworks\esp-idf-v5.5.2\esp_workspace\aiot_agent\components\espressif__esp-dl
+      type: local
     version: 3.3.7
   espressif/esp-dsp:
     component_hash: 12e44db246517a627bc0fe2b255b8335410c0215c98bfba2df5a8e3edea839ef
@@ -151,7 +129,7 @@ dependencies:
       type: service
     version: 1.5.11
   espressif/esp_hosted:
-    component_hash: 59c68fc3a8f25388b9a239ddec5f7bc81e6310d51108db1688e129e791450c31
+    component_hash: 539e5cca7dae1b01abeb2ebd4ed759d793d6f68f7676df357290d949507d96e4
     dependencies:
     - name: idf
       require: private
@@ -159,7 +137,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 2.12.9
+    version: 2.12.10
   espressif/esp_lcd_ek79007:
     component_hash: 8005700b7f10c7136b6e2a3f19a48f972aa1d13ed107ed298574e8d24d17ea83
     dependencies:
@@ -192,7 +170,7 @@ dependencies:
     component_hash: e1e7e6991193c41ed6c9fc386702aa7821433319e7aa9c3147cd3236310cd69c
     dependencies: []
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     targets:
     - esp32
@@ -259,23 +237,30 @@ dependencies:
       type: service
     version: 0.3.2
   espressif/wifi_remote_over_eppp:
-    component_hash: 06d8bc15348bbd21f1390daace36ed5adcf6026c93c5b69decc55fa04df2711a
+    component_hash: 1fd6968af20f0b19e421f6b519b0a8caf81d689afc3783b564c28559e45f66ef
     dependencies:
-    - name: idf
-      require: private
-      version: '>=5.3'
     - name: espressif/eppp_link
       registry_url: https://components.espressif.com
       require: private
       version: '>=0.1'
+    - name: idf
+      require: private
+      version: '>=5.3'
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 0.3.2
+    version: 0.3.3
   idf:
     source:
       type: idf
     version: 5.5.2
+  lvgl/lvgl:
+    component_hash: 184e532558c1c45fefed631f3e235423d22582aafb4630f3e8885c35281a49ae
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 9.5.0
   sensor_init:
     dependencies:
     - name: espressif/esp_cam_sensor
@@ -288,14 +273,17 @@ dependencies:
     version: '*'
 direct_dependencies:
 - dsi_init
+- espressif/dl_fft
 - espressif/esp-sr
 - espressif/esp_cam_sensor
 - espressif/esp_codec_dev
 - espressif/esp_hosted
+- espressif/esp_new_jpeg
 - espressif/esp_wifi_remote
 - espressif/pedestrian_detect
 - idf
+- lvgl/lvgl
 - sensor_init
-manifest_hash: 66f1bd8e5ad230ae041794511cb89c9f226464bb32493ba0538f68346c6bef37
+manifest_hash: c3656b186855cab0f651105505d876a27ac458a5d6f81b53c5dcc412781adb30
 target: esp32p4
 version: 2.0.0

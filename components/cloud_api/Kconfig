@@ -45,6 +45,55 @@ menu "Cloud API Configuration"
         help
             Model name for visual question answering, e.g. doubao-vision-lite-32k.
 
+    choice CLOUD_API_TTS_PROVIDER
+        prompt "TTS provider"
+        default CLOUD_API_TTS_PROVIDER_DOUBAO
+        help
+            Select which cloud TTS service to use for voice reminders.
+
+        config CLOUD_API_TTS_PROVIDER_BAIDU
+            bool "Baidu"
+
+        config CLOUD_API_TTS_PROVIDER_DOUBAO
+            bool "Doubao (Volcano Engine)"
+    endchoice
+
+    config CLOUD_API_DOUBAO_TTS_APPID
+        string "Doubao TTS App ID"
+        depends on CLOUD_API_TTS_PROVIDER_DOUBAO
+        default ""
+        help
+            Doubao/Volcano Engine speech application ID.
+
+    config CLOUD_API_DOUBAO_TTS_TOKEN
+        string "Doubao TTS access token (API Key)"
+        depends on CLOUD_API_TTS_PROVIDER_DOUBAO
+        default ""
+        help
+            Doubao/Volcano Engine speech access token (the API Key shown in console).
+
+    config CLOUD_API_DOUBAO_TTS_CLUSTER
+        string "Doubao TTS cluster"
+        depends on CLOUD_API_TTS_PROVIDER_DOUBAO
+        default "volcano_tts"
+        help
+            Doubao TTS cluster, e.g. volcano_tts.
+
+    config CLOUD_API_DOUBAO_TTS_VOICE
+        string "Doubao TTS voice type"
+        depends on CLOUD_API_TTS_PROVIDER_DOUBAO
+        default "zh_female_sajiaonvyou_moon_bigtts"
+        help
+            Voice type, e.g. zh_female_sajiaonvyou_moon_bigtts.
+
+    config CLOUD_API_DOUBAO_TTS_RATE
+        int "Doubao TTS sample rate"
+        depends on CLOUD_API_TTS_PROVIDER_DOUBAO
+        default 16000
+        range 8000 24000
+        help
+            Output PCM sample rate. 16000 matches the onboard audio pipeline.
+
     config CLOUD_API_VLM_HISTORY_MAX
         int "Max VLM conversation history turns"
         default 6
@@ -53,5 +102,30 @@ menu "Cloud API Configuration"
             Number of recent conversation turns to keep for VLM context.
             Each turn is a user message plus an assistant reply. Set 0 to
             disable context memory.
+
+    config CLOUD_API_LLM_MAX_TOKENS
+        int "Max LLM output tokens"
+        default 200
+        range 20 4096
+        help
+            Limit the number of tokens the cloud LLM returns. A smaller value
+            keeps answers concise and prevents TTS responses from being cut
+            off due to input length limits.
+
+    config CLOUD_API_TTS_MAX_CHARS
+        int "Max TTS input characters"
+        default 200
+        range 50 1000
+        help
+            Truncate long LLM answers before sending them to TTS. This avoids
+            huge PCM buffers and long speech replies.
+
+    config CLOUD_API_VOLCANO_TTS_VOLUME
+        int "Volcano/Baidu TTS output volume scale (percent)"
+        default 80
+        range 0 200
+        help
+            Scale the PCM amplitude returned by TTS. 100 means no change,
+            80 means 0.8x, 50 means half volume. Use 0 to mute.
 
 endmenu

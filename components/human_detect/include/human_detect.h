@@ -24,6 +24,14 @@ typedef bool (*human_frame_reader_t)(uint8_t *dst,
 /* Person-left callback. duration_ms is the last continuous presence duration. */
 typedef void (*human_left_callback_t)(uint32_t duration_ms);
 
+/* Person-present callback: fired once when a person is confirmed present. */
+typedef void (*human_present_callback_t)(void);
+
+/* Person-left reminder callback: fired once after the person has been absent
+ * for CONFIG_HUMAN_DETECT_LEAVE_REMINDER_MS milliseconds. absent_ms is the
+ * actual absence duration at the moment of the call. */
+typedef void (*human_left_reminder_callback_t)(uint32_t absent_ms);
+
 /* Initialize ESP-WHO pedestrian detection and LED linkage. */
 int human_detect_init(void);
 
@@ -44,6 +52,12 @@ void human_set_leave_timeout(uint32_t ms);
 
 /* Register a person-left callback. Pass NULL to unregister. */
 void human_register_left_callback(human_left_callback_t cb);
+
+/* Register a person-present callback. Pass NULL to unregister. */
+void human_register_present_callback(human_present_callback_t cb);
+
+/* Register a one-shot person-left reminder callback. Pass NULL to unregister. */
+void human_register_left_reminder_callback(human_left_reminder_callback_t cb);
 
 #ifdef __cplusplus
 }

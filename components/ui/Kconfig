@@ -1,0 +1,16 @@
+menu "Guardian UI"
+
+config UI_MANAGER_DEMO_ENABLE
+    bool "Enable Guardian video overlay demo flow"
+    default y
+    help
+        Start a lightweight mock HUD flow after ui_manager_init().
+
+config UI_MANAGER_USE_LVGL
+    bool "Use LVGL overlay draw hook"
+    default n
+    help
+        Keep this disabled until the display owner wires LVGL flush and input.
+        The UI manager will still expose the same state and overlay APIs.
+
+endmenu
