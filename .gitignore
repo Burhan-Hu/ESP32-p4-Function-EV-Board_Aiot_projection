@@ -5,4 +5,4 @@ build2_export.log
 sdkconfig
 sdkconfig.old
 sdkconfig.defaults.*
-managed_components/
+managed_components/managed_components/
