@@ -26,6 +26,13 @@
 #define CONFIG_HUMAN_DETECT_LEAVE_REMINDER_MS 60000
 #endif
 
+/* Debug overrides while tuning: hard-code detection cadence and confidence
+ * threshold here so adjustments only rebuild this file (no full re-configure).
+ * Move back to Kconfig (CONFIG_HUMAN_DETECT_INTERVAL_MS /
+ * CONFIG_HUMAN_DETECT_CONFIDENCE_THRESHOLD) once stable. */
+#define HUMAN_DETECT_RUN_INTERVAL_MS    3000
+#define HUMAN_DETECT_CONF_THRESHOLD_PCT 60
+
 static const char *TAG = "human_detect";
 
 static SemaphoreHandle_t s_state_mutex = nullptr;
@@ -56,6 +63,22 @@ static human_left_reminder_callback_t s_reminder_cb = nullptr;
 static bool s_reminder_armed = false;
 static uint32_t s_left_at_ms = 0;
 
+/* Latest detection result, protected by s_state_mutex. */
+static int s_latest_x1 = 0;
+static int s_latest_y1 = 0;
+static int s_latest_x2 = 0;
+static int s_latest_y2 = 0;
+static float s_latest_score = 0.0f;
+static bool s_latest_valid = false;
+
+/* Per-frame callback registered by the app; invoked from the detect task. */
+static human_detect_frame_cb_t s_frame_cb = nullptr;
+
+/* Reject detections whose bbox is too small or too narrow, to suppress
+ * false-positive boxes on plain backgrounds (walls, bedding, curtains). */
+#define HUMAN_DETECT_MIN_BBOX_AREA_PCT  4.0f   /* bbox area >= 4% of frame */
+#define HUMAN_DETECT_MIN_BBOX_WIDTH_PCT 12.0f  /* bbox width >= 12% of frame */
+
 static uint32_t now_ms(void)
 {
     return xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -63,7 +86,7 @@ static uint32_t now_ms(void)
 
 static float confidence_threshold(void)
 {
-    return (float)CONFIG_HUMAN_DETECT_CONFIDENCE_THRESHOLD / 100.0f;
+    return (float)HUMAN_DETECT_CONF_THRESHOLD_PCT / 100.0f;
 }
 
 static bool set_present_locked(bool present,
@@ -204,12 +227,48 @@ static bool run_detection(float *best_score_out)
 
     std::list<dl::detect::result_t> &results = s_detector->run(img);
     float best_score = 0.0f;
+    const dl::detect::result_t *best_result = nullptr;
     for (const auto &result : results) {
-        best_score = std::max(best_score, result.score);
+        if (result.score > best_score) {
+            best_score = result.score;
+            best_result = &result;
+        }
     }
+
+    /* Reject small or narrow boxes: they are usually false positives on plain
+     * backgrounds that would otherwise keep the presence state alive. */
+    if (best_result && best_result->box.size() >= 4) {
+        int bw = best_result->box[2] - best_result->box[0];
+        int bh = best_result->box[3] - best_result->box[1];
+        float frame_area = (float)s_frame_width * (float)s_frame_height;
+        float box_area = (float)bw * (float)bh;
+        bool too_small = (frame_area > 0.0f &&
+                          box_area < frame_area * HUMAN_DETECT_MIN_BBOX_AREA_PCT / 100.0f);
+        bool too_narrow = (s_frame_width > 0 &&
+                           bw < (int)(s_frame_width * HUMAN_DETECT_MIN_BBOX_WIDTH_PCT / 100.0f));
+        if (too_small || too_narrow) {
+            best_result = nullptr;
+            best_score = 0.0f;
+        }
+    }
+
     if (best_score_out != nullptr) {
         *best_score_out = best_score;
     }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (best_result && best_result->box.size() >= 4) {
+        s_latest_valid = true;
+        s_latest_x1 = best_result->box[0];
+        s_latest_y1 = best_result->box[1];
+        s_latest_x2 = best_result->box[2];
+        s_latest_y2 = best_result->box[3];
+        s_latest_score = best_score;
+    } else {
+        s_latest_valid = false;
+    }
+    xSemaphoreGive(s_state_mutex);
+
     return best_score >= confidence_threshold();
 }
 
@@ -226,9 +285,29 @@ static void human_detect_task(void *arg)
             ESP_LOGI(TAG, "pedestrian detect: detected=%d, best_score=%.3f", detected, best_score);
 #endif
             update_presence(detected, now_ms());
+
+            /* Per-frame callback: let the app refresh identity / presence UI
+             * from the raw per-frame result instead of the debounced state. */
+            human_detect_frame_cb_t cb = nullptr;
+            int bx1 = 0, by1 = 0, bx2 = 0, by2 = 0;
+            float bscore = 0.0f;
+            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            cb = s_frame_cb;
+            if (detected && s_latest_valid) {
+                bx1 = s_latest_x1;
+                by1 = s_latest_y1;
+                bx2 = s_latest_x2;
+                by2 = s_latest_y2;
+                bscore = s_latest_score;
+            }
+            xSemaphoreGive(s_state_mutex);
+            if (cb != nullptr) {
+                cb(detected, s_frame_copy, s_frame_width, s_frame_height,
+                   bx1, by1, bx2, by2, bscore);
+            }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(CONFIG_HUMAN_DETECT_INTERVAL_MS));
+        vTaskDelay(pdMS_TO_TICKS(HUMAN_DETECT_RUN_INTERVAL_MS));
     }
 }
 
@@ -397,5 +476,34 @@ void human_register_left_reminder_callback(human_left_reminder_callback_t cb)
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     s_reminder_cb = cb;
+    xSemaphoreGive(s_state_mutex);
+}
+
+bool human_detect_get_latest_bbox(int *x1, int *y1, int *x2, int *y2, float *score)
+{
+    if (s_state_mutex == nullptr) {
+        return false;
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool valid = s_latest_valid;
+    if (valid) {
+        if (x1) *x1 = s_latest_x1;
+        if (y1) *y1 = s_latest_y1;
+        if (x2) *x2 = s_latest_x2;
+        if (y2) *y2 = s_latest_y2;
+        if (score) *score = s_latest_score;
+    }
+    xSemaphoreGive(s_state_mutex);
+    return valid;
+}
+
+void human_detect_register_frame_cb(human_detect_frame_cb_t cb)
+{
+    if (s_state_mutex == nullptr) {
+        return;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_frame_cb = cb;
     xSemaphoreGive(s_state_mutex);
 }

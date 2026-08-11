@@ -1,0 +1,38 @@
+
+    ___________ ____        ____  ____  ____
+   / ____/ ___// __ \      / __ \/ __ \/ __ \
+  / __/  \__ \/ /_/ /_____/ /_/ / /_/ / / / /
+ / /___ ___/ / ____/_____/ ____/ ____/ /_/ /
+/_____//____/_/         /_/   /_/    \___\_\
+
+
+Step 1: quantize without export ...
+[18:59:57] ConvTranspose Decomposition Pass Running ... Finished.
+[18:59:58] PPQ Quantization Fusion Pass Running ...       Finished.
+[18:59:58] PPQ Quantize Simplify Pass Running ...         Finished.
+[18:59:58] PPQ Parameter Quantization Pass Running ...    Finished.
+[18:59:58] PPQ Runtime Calibration Pass Running ...       Finished.
+[19:01:01] PPQ Quantization Alignment Pass Running ...    Finished.
+[19:01:01] PPQ Passive Parameter Quantization Running ... Finished.
+--------- Network Snapshot ---------
+Num of Op:                    [390]
+Num of Quantized Op:          [390]
+Num of Variable:              [708]
+Num of Quantized Var:         [708]
+------- Quantization Snapshot ------
+Num of Quant Config:          [1145]
+ACTIVATED:                    [431]
+OVERLAPPED:                   [492]
+PASSIVE:                      [221]
+FP32:                         [1]
+Network Quantization Finished.
+Step 2: fix conv scales ...
+Fixed 1 ops
+  /model/conv2/conv2.0/gate/fc1/Conv (Conv): 7.451e-09 -> 6.104e-05
+Step 3: export espdl ...
+[38;5;2m[INFO][ESPDL][2026-07-15 19:01:02]:  [mSkip /model/Constant_output_0 because it's not exportable
+[38;5;2m[INFO][ESPDL][2026-07-15 19:01:02]:  [mSkip /model/Constant_output_0 because it's not exportable
+[38;5;2m[INFO][ESPDL][2026-07-15 19:01:02]:  [mSkip /model/Constant_output_0 because it's not exportable
+[38;5;2m[INFO][ESPDL][2026-07-15 19:01:02]:  [mskip not QuantableOperation
+[38;5;2m[INFO][ESPDL][2026-07-15 19:01:02]:  [mSkip /model/Constant_output_0 because it's not exportable
+Saved: outputs/osnet_upperbody.espdl

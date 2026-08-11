@@ -1,0 +1,11 @@
+torch>=2.0
+torchvision>=0.15
+torchreid>=0.2.5
+opencv-python>=4.8
+Pillow>=9.0
+numpy>=1.24,<2.0
+onnx>=1.14
+onnxruntime>=1.15
+tqdm>=4.65
+PyYAML>=6.0
+scipy>=1.10

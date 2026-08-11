@@ -1,0 +1,45 @@
+# OSNet-IBN-x0.25 上半身 Re-ID 训练配置
+# 适配 ESP32-P4 边缘部署：输入 128x64，输出 128 维特征
+
+# ---------- 数据 ----------
+data_root: "../../data/prcc"   # PRCC 解压后的根目录（相对 train.py 所在目录）
+image_size: [128, 64]          # [H, W]，上半身区域 resize 到 128x64
+upper_body_ratio: 0.6          # 取行人框上半 60%（头顶到髋关节）
+mean: [0.485, 0.456, 0.406]
+std: [0.229, 0.224, 0.225]
+
+# ---------- 模型 ----------
+model_name: "osnet_x0_25"      # torchreid 中的 OSNet-x0.25；加 IN=True 实现 IBN 风格
+use_ibn: false                 # 为适配 ESP-DL 部署，关闭 Instance Norm（仅保留 BatchNorm）
+feature_dim: 128               # 边缘端存储与匹配维度
+pretrained: true               # 已连外网，加载 ImageNet 预训练权重
+
+# ---------- 训练 ----------
+num_classes: 150               # PRCC 训练集身份数
+batch_size: 32
+num_instances: 4               # PK 采样：每人 K 张
+num_epochs: 30
+base_lr: 0.001
+lr_stage_b: 0.0001
+lr_stage_c: 0.00001
+warmup_epochs: 2
+
+# 分层冻结阶段（epoch 从 1 开始）
+freeze_until_epoch: 10         # 阶段 A：冻结 Stem + Block1~2
+partial_freeze_until_epoch: 20 # 阶段 B：仅冻结 Block1
+
+# 损失权重
+loss_id_weight: 1.0
+loss_triplet_weight: 1.0
+loss_center_weight: 0.0005
+loss_consistency_weight: 0.5
+consistency_margin: 0.6        # 换装一致性约束阈值 alpha
+
+# ---------- 验证 ----------
+eval_interval: 2               # 每 2 epoch 验证一次，先快速验证修复
+save_interval: 2               # 每 2 epoch 保存 checkpoint
+output_dir: "./outputs"
+
+# ---------- 导出 ----------
+onnx_input_name: "input"
+onnx_output_name: "feature"

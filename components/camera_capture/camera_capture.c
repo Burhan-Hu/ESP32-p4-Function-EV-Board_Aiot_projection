@@ -18,7 +18,7 @@
 
 static const char *TAG = "camera_capture";
 
-#define JPEG_OUTPUT_BUF_SIZE (1024 * 1024) /* 1 MB should be enough for 1024x600 */
+#define JPEG_OUTPUT_BUF_SIZE (512 * 1024) /* 512 KB is enough for 1024x600 @ quality 80 */
 
 static uint8_t *s_rgb_buf = NULL;
 static size_t s_rgb_buf_size = 0;
@@ -27,6 +27,7 @@ static size_t s_jpeg_buf_size = 0;
 static SemaphoreHandle_t s_capture_mutex = NULL;
 static int s_cap_width = 0;
 static int s_cap_height = 0;
+static jpeg_encoder_handle_t s_encoder = NULL;
 
 esp_err_t camera_capture_init(int width, int height)
 {
@@ -82,6 +83,29 @@ esp_err_t camera_capture_init(int width, int height)
         return ESP_ERR_NO_MEM;
     }
 
+    /* Create one persistent JPEG encoder at init time.  The encoder's internal
+     * DMA links need internal RAM; creating it repeatedly at run-time can fail
+     * when the heap is fragmented. */
+    if (s_encoder != NULL) {
+        jpeg_del_encoder_engine(s_encoder);
+        s_encoder = NULL;
+    }
+    jpeg_encode_engine_cfg_t engine_cfg = {
+        .intr_priority = 0,
+        .timeout_ms = 5000,
+    };
+    esp_err_t ret = jpeg_new_encoder_engine(&engine_cfg, &s_encoder);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "failed to create persistent JPEG encoder: %s", esp_err_to_name(ret));
+        heap_caps_free(s_jpeg_buf);
+        s_jpeg_buf = NULL;
+        heap_caps_free(s_rgb_buf);
+        s_rgb_buf = NULL;
+        s_encoder = NULL;
+        xSemaphoreGive(s_capture_mutex);
+        return ret;
+    }
+
     xSemaphoreGive(s_capture_mutex);
     ESP_LOGI(TAG, "capture buffers pre-allocated: %dx%d, rgb=%zu, jpeg=%zu",
              width, height, s_rgb_buf_size, s_jpeg_buf_size);
@@ -118,17 +142,10 @@ esp_err_t camera_capture_jpeg(const uint8_t *rgb565_buf,
     esp_cache_msync((void *)rgb565_buf, rgb565_size, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
     memcpy(s_rgb_buf, rgb565_buf, rgb565_size);
 
-    /* Create a one-shot JPEG encoder. */
-    jpeg_encode_engine_cfg_t engine_cfg = {
-        .intr_priority = 0,
-        .timeout_ms = 5000,
-    };
-    jpeg_encoder_handle_t encoder = NULL;
-    esp_err_t ret = jpeg_new_encoder_engine(&engine_cfg, &encoder);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "failed to create JPEG encoder: %s", esp_err_to_name(ret));
+    if (s_encoder == NULL) {
+        ESP_LOGE(TAG, "JPEG encoder not initialized");
         xSemaphoreGive(s_capture_mutex);
-        return ret;
+        return ESP_ERR_INVALID_STATE;
     }
 
     jpeg_encode_cfg_t encode_cfg = {
@@ -140,12 +157,10 @@ esp_err_t camera_capture_jpeg(const uint8_t *rgb565_buf,
     };
 
     uint32_t jpeg_size = 0;
-    ret = jpeg_encoder_process(encoder, &encode_cfg,
-                               s_rgb_buf, (uint32_t)rgb565_size,
-                               s_jpeg_buf, (uint32_t)s_jpeg_buf_size,
-                               &jpeg_size);
-    jpeg_del_encoder_engine(encoder);
-
+    esp_err_t ret = jpeg_encoder_process(s_encoder, &encode_cfg,
+                                         s_rgb_buf, (uint32_t)rgb565_size,
+                                         s_jpeg_buf, (uint32_t)s_jpeg_buf_size,
+                                         &jpeg_size);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "JPEG encode failed: %s", esp_err_to_name(ret));
         xSemaphoreGive(s_capture_mutex);

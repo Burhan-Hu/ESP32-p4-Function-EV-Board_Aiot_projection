@@ -76,12 +76,18 @@ typedef struct {
     uint32_t event_duration_seconds;
     const char *homework_text;
     const char *course_title;
+
+    /* Re-ID / focus extensions */
+    const char *identity_name;        /* "小明" / "陌生人" / "" */
+    uint32_t current_focus_seconds;   /* current continuous focus session */
+    uint32_t total_focus_seconds;     /* cumulative focus for this identity */
 } ui_model_t;
 
 /* UI 模块只消费状态，不负责算法、网络或摄像头采集。 */
 void ui_manager_init(void);
 void ui_manager_show_page(ui_page_t page);
 void ui_manager_update(const ui_model_t *model);
+void ui_manager_update_timer(uint32_t current_seconds, uint32_t total_seconds);
 void ui_manager_push_event(const ui_event_t *event);
 void ui_manager_clear_event(void);
 void ui_manager_show_alert(const char *event_type, const char *message);

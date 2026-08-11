@@ -22,6 +22,9 @@
 #include "sdkconfig.h"
 #include "cloud_api.h"
 
+#define MINIMP3_IMPLEMENTATION
+#include "minimp3_ex.h"
+
 static const char *TAG = "cloud_api";
 
 static char s_baidu_token[256] = {0};
@@ -494,17 +497,174 @@ static esp_err_t baidu_tts(const char *text, int16_t **pcm_out, size_t *sample_c
 /* Doubao (Volcano Engine) TTS                                                */
 /* -------------------------------------------------------------------------- */
 
-static void generate_reqid(char *buf, size_t len)
+static esp_err_t ndjson_collect_mp3(const char *resp, size_t resp_len,
+                                    uint8_t **mp3_out, size_t *mp3_len_out)
 {
-    uint32_t r[4];
-    for (int i = 0; i < 4; i++) {
-        r[i] = esp_random();
+    *mp3_out = NULL;
+    *mp3_len_out = 0;
+
+    size_t cap = 4096;
+    uint8_t *buf = (uint8_t *)malloc(cap);
+    if (buf == NULL) {
+        return ESP_ERR_NO_MEM;
     }
-    snprintf(buf, len, "%08x-%04x-%04x-%04x-%04x%08x",
-             (unsigned int)r[0],
-             (unsigned int)(r[1] & 0xFFFF), (unsigned int)((r[1] >> 16) & 0xFFFF),
-             (unsigned int)(r[2] & 0xFFFF), (unsigned int)((r[2] >> 16) & 0xFFFF),
-             (unsigned int)r[3]);
+    size_t len = 0;
+
+    const char *p = resp;
+    const char *end = resp + resp_len;
+
+    while (p < end) {
+        const char *line_end = p;
+        while (line_end < end && *line_end != '\n' && *line_end != '\r') {
+            line_end++;
+        }
+        size_t line_len = line_end - p;
+        if (line_len > 0) {
+            char *line = (char *)malloc(line_len + 1);
+            if (line == NULL) {
+                free(buf);
+                return ESP_ERR_NO_MEM;
+            }
+            memcpy(line, p, line_len);
+            line[line_len] = '\0';
+
+            cJSON *json = cJSON_Parse(line);
+            free(line);
+            if (json != NULL) {
+                cJSON *code_item = cJSON_GetObjectItem(json, "code");
+                if (code_item != NULL && cJSON_IsNumber(code_item)) {
+                    int code = code_item->valueint;
+                    if (code != 0 && code != 20000000) {
+                        cJSON *msg = cJSON_GetObjectItem(json, "message");
+                        ESP_LOGE(TAG, "Doubao TTS stream error: code=%d, message=%s",
+                                 code, msg && cJSON_IsString(msg) ? msg->valuestring : "");
+                        cJSON_Delete(json);
+                        free(buf);
+                        return ESP_FAIL;
+                    }
+                    if (code == 20000000) {
+                        cJSON_Delete(json);
+                        break;
+                    }
+                    cJSON *data = cJSON_GetObjectItem(json, "data");
+                    if (data != NULL && cJSON_IsString(data)) {
+                        const char *b64 = data->valuestring;
+                        size_t b64_len = strlen(b64);
+                        size_t dec_len = 0;
+                        mbedtls_base64_decode(NULL, 0, &dec_len,
+                                              (const unsigned char *)b64, b64_len);
+                        if (dec_len > 0) {
+                            if (len + dec_len > cap) {
+                                cap = (len + dec_len) * 2;
+                                uint8_t *tmp = (uint8_t *)realloc(buf, cap);
+                                if (tmp == NULL) {
+                                    cJSON_Delete(json);
+                                    free(buf);
+                                    return ESP_ERR_NO_MEM;
+                                }
+                                buf = tmp;
+                            }
+                            mbedtls_base64_decode(buf + len, dec_len, &dec_len,
+                                                  (const unsigned char *)b64, b64_len);
+                            len += dec_len;
+                        }
+                    }
+                }
+                cJSON_Delete(json);
+            }
+        }
+        p = line_end + 1;
+        while (p < end && (*p == '\n' || *p == '\r')) {
+            p++;
+        }
+    }
+
+    if (len == 0) {
+        free(buf);
+        return ESP_FAIL;
+    }
+
+    *mp3_out = buf;
+    *mp3_len_out = len;
+    return ESP_OK;
+}
+
+static int16_t *mono_resample_24000_to_16000(const mp3d_sample_t *in, size_t total_samples,
+                                             int channels, size_t *out_samples)
+{
+    size_t in_mono = total_samples / channels;
+    if (in_mono == 0) {
+        return NULL;
+    }
+
+    int16_t *mono = (int16_t *)malloc(in_mono * sizeof(int16_t));
+    if (mono == NULL) {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < in_mono; i++) {
+        int32_t sum = 0;
+        for (int c = 0; c < channels; c++) {
+            sum += in[i * channels + c];
+        }
+        mono[i] = (int16_t)(sum / channels);
+    }
+
+    size_t out_count = (in_mono / 3) * 2;
+    if (out_count == 0) {
+        free(mono);
+        return NULL;
+    }
+
+    int16_t *out = (int16_t *)heap_caps_malloc(out_count * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (out == NULL) {
+        free(mono);
+        return NULL;
+    }
+
+    for (size_t i = 0; i < out_count / 2; i++) {
+        out[2 * i] = mono[3 * i];
+        out[2 * i + 1] = (mono[3 * i + 1] + mono[3 * i + 2]) / 2;
+    }
+
+    free(mono);
+    *out_samples = out_count;
+    return out;
+}
+
+static int16_t *mp3_to_pcm_16k(const uint8_t *mp3_buf, size_t mp3_len, size_t *sample_count)
+{
+    mp3dec_t dec;
+    mp3dec_file_info_t info;
+    mp3dec_init(&dec);
+    int ret = mp3dec_load_buf(&dec, mp3_buf, mp3_len, &info, NULL, NULL);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "mp3 decode failed: %d", ret);
+        return NULL;
+    }
+    if (info.samples == 0 || info.buffer == NULL) {
+        ESP_LOGE(TAG, "mp3 decode returned empty audio");
+        free(info.buffer);
+        return NULL;
+    }
+
+    int16_t *pcm = NULL;
+    if (info.hz == 16000) {
+        pcm = (int16_t *)heap_caps_malloc(info.samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+        if (pcm != NULL) {
+            for (size_t i = 0; i < info.samples; i++) {
+                pcm[i] = info.buffer[i];
+            }
+            *sample_count = info.samples;
+        }
+    } else if (info.hz == 24000) {
+        pcm = mono_resample_24000_to_16000(info.buffer, info.samples, info.channels, sample_count);
+    } else {
+        ESP_LOGE(TAG, "unsupported mp3 sample rate: %d", info.hz);
+    }
+
+    free(info.buffer);
+    return pcm;
 }
 
 static esp_err_t doubao_tts(const char *text,
@@ -514,41 +674,31 @@ static esp_err_t doubao_tts(const char *text,
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (CONFIG_CLOUD_API_DOUBAO_TTS_APPID[0] == '\0' ||
-        CONFIG_CLOUD_API_DOUBAO_TTS_TOKEN[0] == '\0' ||
-        CONFIG_CLOUD_API_DOUBAO_TTS_CLUSTER[0] == '\0') {
-        ESP_LOGE(TAG, "Doubao TTS appid/token/cluster not configured");
+    if (CONFIG_CLOUD_API_DOUBAO_TTS_TOKEN[0] == '\0') {
+        ESP_LOGE(TAG, "Doubao TTS API key not configured");
         return ESP_ERR_INVALID_STATE;
     }
 
-    char reqid[40];
-    generate_reqid(reqid, sizeof(reqid));
-
+    /* Build v3 request body matching the console example:
+     * https://openspeech.bytedance.com/api/v3/tts/unidirectional
+     */
     cJSON *root = cJSON_CreateObject();
-    cJSON *app = cJSON_CreateObject();
-    cJSON_AddStringToObject(app, "appid", CONFIG_CLOUD_API_DOUBAO_TTS_APPID);
-    cJSON_AddStringToObject(app, "token", "access_token");
-    cJSON_AddStringToObject(app, "cluster", CONFIG_CLOUD_API_DOUBAO_TTS_CLUSTER);
-    cJSON_AddItemToObject(root, "app", app);
+    cJSON *req_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(req_params, "text", text);
+    cJSON_AddStringToObject(req_params, "speaker", CONFIG_CLOUD_API_DOUBAO_TTS_VOICE);
+    cJSON_AddStringToObject(req_params, "additions",
+                            "{\"disable_markdown_filter\":true,"
+                            "\"enable_language_detector\":true,"
+                            "\"enable_latex_tn\":true,"
+                            "\"disable_default_bit_rate\":true,"
+                            "\"max_length_to_filter_parenthesis\":0,"
+                            "\"cache_config\":{\"text_type\":1,\"use_cache\":true}}");
 
-    cJSON *user = cJSON_CreateObject();
-    cJSON_AddStringToObject(user, "uid", CONFIG_CLOUD_API_BAIDU_CUID);
-    cJSON_AddItemToObject(root, "user", user);
-
-    cJSON *audio = cJSON_CreateObject();
-    cJSON_AddStringToObject(audio, "voice_type", CONFIG_CLOUD_API_DOUBAO_TTS_VOICE);
-    cJSON_AddStringToObject(audio, "encoding", "pcm");
-    cJSON_AddNumberToObject(audio, "rate", CONFIG_CLOUD_API_DOUBAO_TTS_RATE);
-    cJSON_AddNumberToObject(audio, "speed_ratio", 1.0);
-    cJSON_AddNumberToObject(audio, "volume_ratio", 1.0);
-    cJSON_AddItemToObject(root, "audio", audio);
-
-    cJSON *req = cJSON_CreateObject();
-    cJSON_AddStringToObject(req, "reqid", reqid);
-    cJSON_AddStringToObject(req, "text", text);
-    cJSON_AddStringToObject(req, "text_type", "plain");
-    cJSON_AddStringToObject(req, "operation", "query");
-    cJSON_AddItemToObject(root, "request", req);
+    cJSON *audio_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(audio_params, "format", "mp3");
+    cJSON_AddNumberToObject(audio_params, "sample_rate", 24000);
+    cJSON_AddItemToObject(req_params, "audio_params", audio_params);
+    cJSON_AddItemToObject(root, "req_params", req_params);
 
     char *body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -556,15 +706,10 @@ static esp_err_t doubao_tts(const char *text,
         return ESP_ERR_NO_MEM;
     }
 
-    char auth_header[128];
-    snprintf(auth_header, sizeof(auth_header), "Bearer;%s", CONFIG_CLOUD_API_DOUBAO_TTS_TOKEN);
+    ESP_LOGI(TAG, "Doubao TTS v3 request: %s", body);
 
-    /* The http_request helper sets Accept from accept_type, but it does not
-     * have a dedicated Authorization header argument. Add it via the extra
-     * header hook by constructing the client config ourselves is overkill;
-     * instead we use esp_http_client directly for this single call. */
     esp_http_client_config_t config = {
-        .url = "https://openspeech.bytedance.com/api/v1/tts",
+        .url = "https://openspeech.bytedance.com/api/v3/tts/unidirectional",
         .method = HTTP_METHOD_POST,
         .timeout_ms = 30000,
         .crt_bundle_attach = esp_crt_bundle_attach,
@@ -576,9 +721,13 @@ static esp_err_t doubao_tts(const char *text,
         free(body);
         return ESP_FAIL;
     }
-    esp_http_client_set_header(client, "Authorization", auth_header);
+    esp_http_client_set_header(client, "x-api-key", CONFIG_CLOUD_API_DOUBAO_TTS_TOKEN);
+    if (CONFIG_CLOUD_API_DOUBAO_TTS_APPID[0] != '\0') {
+        esp_http_client_set_header(client, "X-Api-App-Id", CONFIG_CLOUD_API_DOUBAO_TTS_APPID);
+    }
+    esp_http_client_set_header(client, "X-Api-Resource-Id", "volc.service_type.10029");
+    esp_http_client_set_header(client, "Connection", "keep-alive");
     esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "Accept", "application/json");
 
     size_t body_len = strlen(body);
     esp_err_t err = esp_http_client_open(client, (int)body_len);
@@ -613,6 +762,7 @@ static esp_err_t doubao_tts(const char *text,
         return ESP_FAIL;
     }
 
+    /* Read full NDJSON response (chunked or fixed-length). */
     int read_len = content_length > 0 ? (int)content_length : 4096;
     char *resp = (char *)malloc(read_len + 1);
     if (resp == NULL) {
@@ -643,64 +793,29 @@ static esp_err_t doubao_tts(const char *text,
     resp[total_read] = '\0';
     esp_http_client_cleanup(client);
 
-    cJSON *resp_json = cJSON_Parse(resp);
-    if (resp_json == NULL) {
-        ESP_LOGE(TAG, "Doubao TTS response is not valid JSON");
+    if (total_read == 0) {
+        ESP_LOGE(TAG, "Doubao TTS empty response");
         free(resp);
         return ESP_FAIL;
     }
 
-    cJSON *code_item = cJSON_GetObjectItem(resp_json, "code");
-    if (code_item != NULL && cJSON_IsNumber(code_item) && code_item->valueint != 0) {
-        cJSON *msg_item = cJSON_GetObjectItem(resp_json, "message");
-        ESP_LOGE(TAG, "Doubao TTS error: code=%d, message=%s",
-                 code_item->valueint,
-                 msg_item && cJSON_IsString(msg_item) ? msg_item->valuestring : "(none)");
-        cJSON_Delete(resp_json);
-        free(resp);
-        return ESP_FAIL;
-    }
-
-    cJSON *data_item = cJSON_GetObjectItem(resp_json, "data");
-    if (data_item == NULL || !cJSON_IsString(data_item)) {
-        ESP_LOGE(TAG, "Doubao TTS response missing data field");
-        cJSON_Delete(resp_json);
-        free(resp);
-        return ESP_FAIL;
-    }
-
-    const char *b64 = data_item->valuestring;
-    size_t b64_len = strlen(b64);
-    size_t pcm_len = 0;
-    mbedtls_base64_decode(NULL, 0, &pcm_len, (const unsigned char *)b64, b64_len);
-    if (pcm_len == 0) {
-        ESP_LOGE(TAG, "Doubao TTS returned empty audio");
-        cJSON_Delete(resp_json);
-        free(resp);
-        return ESP_FAIL;
-    }
-
-    int16_t *pcm = (int16_t *)heap_caps_malloc(pcm_len, MALLOC_CAP_SPIRAM);
-    if (pcm == NULL) {
-        cJSON_Delete(resp_json);
-        free(resp);
-        return ESP_ERR_NO_MEM;
-    }
-
-    size_t decoded_len = 0;
-    int bret = mbedtls_base64_decode((unsigned char *)pcm, pcm_len, &decoded_len,
-                                     (const unsigned char *)b64, b64_len);
-    cJSON_Delete(resp_json);
+    uint8_t *mp3_buf = NULL;
+    size_t mp3_len = 0;
+    err = ndjson_collect_mp3(resp, (size_t)total_read, &mp3_buf, &mp3_len);
     free(resp);
-    if (bret != 0 || decoded_len != pcm_len) {
-        ESP_LOGE(TAG, "Doubao TTS base64 decode failed: ret=%d decoded=%zu expected=%zu",
-                 bret, decoded_len, pcm_len);
-        heap_caps_free(pcm);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Doubao TTS collected mp3_len=%zu", mp3_len);
+
+    int16_t *pcm = mp3_to_pcm_16k(mp3_buf, mp3_len, sample_count_out);
+    free(mp3_buf);
+    if (pcm == NULL) {
         return ESP_FAIL;
     }
 
     *pcm_out = pcm;
-    *sample_count_out = decoded_len / sizeof(int16_t);
     ESP_LOGI(TAG, "Doubao TTS OK, samples=%zu", *sample_count_out);
     return ESP_OK;
 }

@@ -113,14 +113,18 @@ static void render_idle_overlay(const ui_model_t *model)
 
 static void render_focus_overlay(const ui_model_t *model)
 {
-    uint32_t minutes = model->study_seconds / 60;
-    uint32_t seconds = model->study_seconds % 60;
+    uint32_t cur_min = model->current_focus_seconds / 60;
+    uint32_t cur_sec = model->current_focus_seconds % 60;
+    uint32_t tot_min = model->total_focus_seconds / 60;
+    uint32_t tot_sec = model->total_focus_seconds % 60;
+    const char *name = safe_text(model->identity_name, "");
 
     ESP_LOGI(TAG,
-             "video overlay focus | top-left: 专注守护中 %02" PRIu32 ":%02" PRIu32
+             "video overlay focus | %s | 当前 %02" PRIu32 ":%02" PRIu32
+             " | 累计 %02" PRIu32 ":%02" PRIu32
              " | top-right: LearnScore %d, 风险 %d | bottom: 在座 %s / 页面 %s / 姿态 %s",
-             minutes,
-             seconds,
+             name[0] ? name : "未识别",
+             cur_min, cur_sec, tot_min, tot_sec,
              model->learn_score,
              model->risk_level,
              safe_text(model->seat_state, "检测中"),

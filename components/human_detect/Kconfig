@@ -23,7 +23,7 @@ menu "Human Detection Configuration"
 
     config HUMAN_DETECT_CONFIDENCE_THRESHOLD
         int "Pedestrian confidence threshold percent"
-        default 55
+        default 70
         range 1 100
         help
             Best detection score must be at least this percent to count as a person.
@@ -37,7 +37,7 @@ menu "Human Detection Configuration"
 
     config HUMAN_DETECT_LEAVE_TIMEOUT_MS
         int "Person-left timeout in milliseconds"
-        default 8000
+        default 3000
         range 500 600000
         help
             LED turns off only after no person has been detected for this timeout.

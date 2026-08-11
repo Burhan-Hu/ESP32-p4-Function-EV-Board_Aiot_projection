@@ -36,6 +36,7 @@ static ui_overlay_mode_t s_mode = UI_OVERLAY_IDLE;
 static ui_model_t s_model = {0};
 static ui_event_t s_event = {0};
 static bool s_model_updated = false;
+static bool s_timer_updated = false;
 
 static lv_display_t *s_disp = NULL;
 
@@ -74,10 +75,16 @@ static lv_obj_t *s_summary_text = NULL;
  * See tools_temp/gen_ui_font.py
  */
 LV_FONT_DECLARE(ui_font_custom);
+LV_FONT_DECLARE(ui_font_custom_large);
 
 static const lv_font_t *ui_font(void)
 {
     return &ui_font_custom;
+}
+
+static const lv_font_t *ui_font_large(void)
+{
+    return &ui_font_custom_large;
 }
 
 static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
@@ -94,6 +101,13 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
     lv_display_flush_ready(disp);
 }
 
+/* Turn off LVGL's default scrollbars/scrolling for plain containers. */
+static void no_scrollbars(lv_obj_t *obj)
+{
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(obj, LV_SCROLLBAR_MODE_OFF);
+}
+
 static void set_container_style(lv_obj_t *obj, lv_color_t bg, lv_opa_t opa)
 {
     lv_obj_set_style_bg_color(obj, bg, 0);
@@ -101,6 +115,7 @@ static void set_container_style(lv_obj_t *obj, lv_color_t bg, lv_opa_t opa)
     lv_obj_set_style_border_width(obj, 0, 0);
     lv_obj_set_style_radius(obj, 8, 0);
     lv_obj_set_style_pad_all(obj, 8, 0);
+    no_scrollbars(obj);
 }
 
 static lv_obj_t *make_label(lv_obj_t *parent, const char *text, lv_color_t color)
@@ -122,8 +137,15 @@ static void update_top_bar(void)
 
 static void update_status_row(void)
 {
-    lv_label_set_text_fmt(s_seat_label, "在座\n%s",
-                          s_model.seat_state && s_model.seat_state[0] ? s_model.seat_state : "检测中");
+    const char *name = s_model.identity_name && s_model.identity_name[0]
+                           ? s_model.identity_name
+                           : "未识别";
+    uint32_t tot_m = s_model.total_focus_seconds / 60;
+    uint32_t tot_s = s_model.total_focus_seconds % 60;
+
+    lv_label_set_text_fmt(s_seat_label, "%s\n%s\n累计 %02" PRIu32 ":%02" PRIu32,
+                          s_model.seat_state && s_model.seat_state[0] ? s_model.seat_state : "检测中",
+                          name, tot_m, tot_s);
     lv_label_set_text_fmt(s_pose_label, "姿态\n%s",
                           s_model.pose_state && s_model.pose_state[0] ? s_model.pose_state : "检测中");
     lv_label_set_text_fmt(s_screen_label, "页面\n%s",
@@ -132,9 +154,9 @@ static void update_status_row(void)
 
 static void update_timer(void)
 {
-    uint32_t m = s_model.study_seconds / 60;
-    uint32_t sec = s_model.study_seconds % 60;
-    lv_label_set_text_fmt(s_timer_label, "%02" PRIu32 ":%02" PRIu32, m, sec);
+    uint32_t cur_m = s_model.current_focus_seconds / 60;
+    uint32_t cur_s = s_model.current_focus_seconds % 60;
+    lv_label_set_text_fmt(s_timer_label, "专注\n%02" PRIu32 ":%02" PRIu32, cur_m, cur_s);
 }
 
 static void update_alert(void)
@@ -253,6 +275,37 @@ static void set_face_expression(ui_overlay_mode_t mode)
     }
 }
 
+/* ---- Kimi-style blink animation --------------------------------------
+ * Every blink period, shrink both eyes to a thin line briefly, then
+ * restore them. Runs entirely on LVGL timers inside the LVGL task. */
+static void face_blink_open(lv_timer_t *timer)
+{
+    (void)timer;
+    if (s_face_eye_l) {
+        lv_obj_set_size(s_face_eye_l, 18, 26);
+        lv_obj_set_pos(s_face_eye_l, 29, 28);
+    }
+    if (s_face_eye_r) {
+        lv_obj_set_size(s_face_eye_r, 18, 26);
+        lv_obj_set_pos(s_face_eye_r, 73, 28);
+    }
+}
+
+static void face_blink_close(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!s_face_eye_l || !s_face_eye_r) {
+        return;
+    }
+    lv_obj_set_size(s_face_eye_l, 18, 3);
+    lv_obj_set_pos(s_face_eye_l, 29, 40);
+    lv_obj_set_size(s_face_eye_r, 18, 3);
+    lv_obj_set_pos(s_face_eye_r, 73, 40);
+
+    lv_timer_t *open_timer = lv_timer_create(face_blink_open, 140, NULL);
+    lv_timer_set_repeat_count(open_timer, 1);
+}
+
 static void create_face(lv_obj_t *parent)
 {
     s_face_container = lv_obj_create(parent);
@@ -261,6 +314,7 @@ static void create_face(lv_obj_t *parent)
     lv_obj_set_style_bg_opa(s_face_container, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_face_container, 0, 0);
     lv_obj_set_style_pad_all(s_face_container, 0, 0);
+    no_scrollbars(s_face_container);
 
     /* Head: a glossy Kimi-blue sphere. */
     lv_obj_t *head = lv_obj_create(s_face_container);
@@ -276,6 +330,7 @@ static void create_face(lv_obj_t *parent)
     lv_obj_set_style_shadow_opa(head, LV_OPA_30, 0);
     lv_obj_set_style_shadow_offset_x(head, 0, 0);
     lv_obj_set_style_shadow_offset_y(head, 5, 0);
+    no_scrollbars(head);
 
     /* Gloss highlight, upper-left. */
     lv_obj_t *hl = lv_obj_create(head);
@@ -340,13 +395,16 @@ static void create_face(lv_obj_t *parent)
     s_face_label = make_label(s_face_container, "AI 伴学", lv_color_white());
     lv_obj_set_style_text_font(s_face_label, ui_font(), 0);
     lv_obj_set_pos(s_face_label, 44, 128);
+
+    /* Blink roughly every 3 seconds. */
+    lv_timer_create(face_blink_close, 3000, NULL);
 }
 
 static void create_status_row(lv_obj_t *parent)
 {
     s_status_bar = lv_obj_create(parent);
-    lv_obj_set_size(s_status_bar, s_ui_width - 120, 64);
-    lv_obj_set_pos(s_status_bar, 100, s_height - 80);
+    lv_obj_set_size(s_status_bar, s_ui_width - 120, 84);
+    lv_obj_set_pos(s_status_bar, 100, s_height - 100);
     set_container_style(s_status_bar, lv_color_black(), LV_OPA_50);
     lv_obj_set_flex_flow(s_status_bar, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(s_status_bar, LV_FLEX_ALIGN_SPACE_AROUND, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -367,22 +425,25 @@ static void create_status_row(lv_obj_t *parent)
 static void create_timer(lv_obj_t *parent)
 {
     s_timer_label = lv_label_create(parent);
-    lv_label_set_text(s_timer_label, "00:00");
-    lv_obj_set_style_text_font(s_timer_label, ui_font(), 0);
+    lv_label_set_text(s_timer_label, "专注\n00:00");
+    lv_obj_set_style_text_font(s_timer_label, ui_font_large(), 0);
     lv_obj_set_style_text_color(s_timer_label, lv_color_white(), 0);
     lv_obj_set_style_text_opa(s_timer_label, LV_OPA_90, 0);
+    lv_obj_set_style_text_align(s_timer_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_bg_color(s_timer_label, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(s_timer_label, LV_OPA_40, 0);
     lv_obj_set_style_radius(s_timer_label, 8, 0);
     lv_obj_set_style_pad_all(s_timer_label, 12, 0);
-    lv_obj_set_pos(s_timer_label, s_ui_width / 2 - 70, s_height / 2 - 30);
+    /* Big timer centred horizontally, right under the AI face. */
+    lv_obj_set_size(s_timer_label, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_align(s_timer_label, LV_ALIGN_TOP_MID, 0, 250);
 }
 
 static void create_alert(lv_obj_t *parent)
 {
     s_alert_bar = lv_obj_create(parent);
     lv_obj_set_size(s_alert_bar, s_ui_width - 40, 90);
-    lv_obj_set_pos(s_alert_bar, 20, s_height - 120);
+    lv_obj_set_pos(s_alert_bar, 20, s_height - 140);
     set_container_style(s_alert_bar, lv_palette_main(LV_PALETTE_ORANGE), LV_OPA_80);
 
     s_alert_title = make_label(s_alert_bar, "提醒", lv_color_white());
@@ -432,6 +493,7 @@ static void lvgl_ui_create(void)
     lv_obj_set_style_border_width(ui_panel, 0, 0);
     lv_obj_set_style_pad_all(ui_panel, 0, 0);
     lv_obj_set_style_radius(ui_panel, 0, 0);
+    no_scrollbars(ui_panel);
 
     create_top_bar(ui_panel);
     create_face(ui_panel);
@@ -490,6 +552,9 @@ static void ui_lvgl_task(void *arg)
             if (s_model_updated) {
                 s_model_updated = false;
                 rebuild_ui_for_state();
+            } else if (s_timer_updated) {
+                s_timer_updated = false;
+                update_timer();
             }
             xSemaphoreGive(s_state_lock);
         }
@@ -541,6 +606,23 @@ void ui_lvgl_notify_frame_ready(BaseType_t *pxHigherPriorityTaskWoken)
             *pxHigherPriorityTaskWoken = pdTRUE;
         }
     }
+}
+
+void ui_lvgl_update_timer(uint32_t current_seconds, uint32_t total_seconds)
+{
+    if (!s_state_lock) {
+        return;
+    }
+
+    if (xSemaphoreTake(s_state_lock, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return;
+    }
+
+    s_model.current_focus_seconds = current_seconds;
+    s_model.total_focus_seconds = total_seconds;
+    s_timer_updated = true;
+
+    xSemaphoreGive(s_state_lock);
 }
 
 void ui_lvgl_update(ui_overlay_mode_t mode, const ui_model_t *model, const ui_event_t *event)
@@ -606,6 +688,9 @@ static bool model_equal(const ui_model_t *a, const ui_model_t *b)
            a->risk_level == b->risk_level &&
            a->study_seconds == b->study_seconds &&
            a->event_duration_seconds == b->event_duration_seconds &&
+           a->current_focus_seconds == b->current_focus_seconds &&
+           a->total_focus_seconds == b->total_focus_seconds &&
+           string_equal(a->identity_name, b->identity_name) &&
            string_equal(a->seat_state, b->seat_state) &&
            string_equal(a->screen_state, b->screen_state) &&
            string_equal(a->pose_state, b->pose_state) &&

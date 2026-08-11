@@ -85,7 +85,7 @@ esp_err_t pir_start(void)
         return ESP_OK;
     }
 
-    BaseType_t ret = xTaskCreate(pir_task, "pir_task", 16384, NULL, 5, NULL);
+    BaseType_t ret = xTaskCreate(pir_task, "pir_task", 32768, NULL, 5, NULL);
     ESP_RETURN_ON_FALSE(ret == pdPASS, ESP_ERR_NO_MEM, TAG,
                         "failed to create PIR task");
 

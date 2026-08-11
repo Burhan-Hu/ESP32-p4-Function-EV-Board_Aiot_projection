@@ -26,6 +26,11 @@ void ui_lvgl_init(void *display_buf, void *cam_buf, int width, int height);
 void ui_lvgl_notify_frame_ready(BaseType_t *pxHigherPriorityTaskWoken);
 
 /**
+ * @brief Update only the focus timer labels without rebuilding the overlay.
+ */
+void ui_lvgl_update_timer(uint32_t current_seconds, uint32_t total_seconds);
+
+/**
  * @brief Update the model/event that the overlay should display.
  *
  * The actual LVGL rendering happens in the overlay task.

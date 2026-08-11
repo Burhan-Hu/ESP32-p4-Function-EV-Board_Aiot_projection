@@ -31,6 +31,10 @@ static int16_t *s_record_stereo_buf = NULL;
 static int16_t *s_record_mono_buf = NULL;
 static SemaphoreHandle_t s_record_buf_mutex = NULL;
 
+/* Pre-allocated playback chunk buffer to avoid runtime DMA allocation
+ * failures when multiple cloud tasks are using internal memory. */
+static int16_t *s_playback_chunk_buf = NULL;
+
 static i2s_chan_handle_t s_tx_handle = NULL;
 static i2s_chan_handle_t s_rx_handle = NULL;
 static esp_codec_dev_handle_t s_codec_handle = NULL;
@@ -180,6 +184,15 @@ esp_err_t audio_init(i2c_master_bus_handle_t i2c_bus_handle)
         return ESP_ERR_NO_MEM;
     }
 
+    const size_t playback_chunk_stereo_samples = 1024 * AUDIO_CHANNELS;
+    s_playback_chunk_buf = (int16_t *)heap_caps_malloc(
+        playback_chunk_stereo_samples * sizeof(int16_t),
+        MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (s_playback_chunk_buf == NULL) {
+        ESP_LOGE(TAG, "failed to pre-allocate playback chunk buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
     ESP_LOGI(TAG, "Audio initialized successfully");
     return ESP_OK;
 }
@@ -267,18 +280,15 @@ esp_err_t audio_play_pcm(const int16_t *pcm, size_t sample_count)
         return ESP_OK;
     }
 
-    /* Stream playback using a small fixed-size DMA buffer to avoid large
-     * allocations for long TTS responses. */
+    if (s_playback_chunk_buf == NULL) {
+        ESP_LOGE(TAG, "playback chunk buffer not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Stream playback using a small fixed-size DMA buffer pre-allocated at
+     * init time to avoid allocation failures under memory pressure. */
     const size_t chunk_mono_samples = 1024;
     const size_t chunk_stereo_samples = chunk_mono_samples * AUDIO_CHANNELS;
-    const size_t chunk_stereo_bytes = chunk_stereo_samples * sizeof(int16_t);
-
-    int16_t *stereo_buf = (int16_t *)heap_caps_malloc(chunk_stereo_bytes,
-                                                       MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    if (stereo_buf == NULL) {
-        ESP_LOGE(TAG, "failed to allocate playback chunk buffer");
-        return ESP_ERR_NO_MEM;
-    }
 
     audio_codec_lock();
     size_t offset = 0;
@@ -288,28 +298,25 @@ esp_err_t audio_play_pcm(const int16_t *pcm, size_t sample_count)
         size_t cur_stereo_bytes = cur_mono * AUDIO_CHANNELS * sizeof(int16_t);
 
         for (size_t i = 0; i < cur_mono; i++) {
-            /* Amplify by 2x ("放大1倍") and clamp to int16 range. */
-            int32_t amplified = (int32_t)pcm[offset + i] * 2;
-            if (amplified > INT16_MAX) {
-                amplified = INT16_MAX;
-            } else if (amplified < INT16_MIN) {
-                amplified = INT16_MIN;
+            int32_t sample = (int32_t)pcm[offset + i];
+            if (sample > INT16_MAX) {
+                sample = INT16_MAX;
+            } else if (sample < INT16_MIN) {
+                sample = INT16_MIN;
             }
-            stereo_buf[i * AUDIO_CHANNELS]     = (int16_t)amplified;
-            stereo_buf[i * AUDIO_CHANNELS + 1] = (int16_t)amplified;
+            s_playback_chunk_buf[i * AUDIO_CHANNELS]     = (int16_t)sample;
+            s_playback_chunk_buf[i * AUDIO_CHANNELS + 1] = (int16_t)sample;
         }
 
-        int ret = esp_codec_dev_write(s_codec_handle, stereo_buf, (int)cur_stereo_bytes);
+        int ret = esp_codec_dev_write(s_codec_handle, s_playback_chunk_buf, (int)cur_stereo_bytes);
         if (ret != ESP_CODEC_DEV_OK) {
             audio_codec_unlock();
-            heap_caps_free(stereo_buf);
             ESP_LOGE(TAG, "codec write failed: %d", ret);
             return ESP_FAIL;
         }
         offset += cur_mono;
     }
     audio_codec_unlock();
-    heap_caps_free(stereo_buf);
     return ESP_OK;
 }
 

@@ -47,6 +47,21 @@ int human_detect_start(void);
 /* Current debounced person-present state. */
 bool human_is_present(void);
 
+/* Get the latest detected person bbox (if any). Returns true when a valid bbox
+ * is available in the last detection frame. */
+bool human_detect_get_latest_bbox(int *x1, int *y1, int *x2, int *y2, float *score);
+
+/* Per-frame detection callback, invoked from the detection task after every
+ * inference run. When detected is true, rgb565/bbox describe the best person
+ * box that passed the confidence and area filters; when false, no person was
+ * confirmed in this frame. The rgb565 pointer is valid only during the call. */
+typedef void (*human_detect_frame_cb_t)(bool detected,
+                                        const uint8_t *rgb565, int width, int height,
+                                        int x1, int y1, int x2, int y2, float score);
+
+/* Register a per-frame callback. Pass NULL to unregister. */
+void human_detect_register_frame_cb(human_detect_frame_cb_t cb);
+
 /* Set person-left timeout in milliseconds. */
 void human_set_leave_timeout(uint32_t ms);
 

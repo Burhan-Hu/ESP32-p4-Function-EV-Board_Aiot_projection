@@ -39,7 +39,7 @@ menu "Audio Configuration"
     config AUDIO_PLAYBACK_VOLUME
         int "Default playback volume"
         range 0 100
-        default 60
+        default 100
         help
             Default output volume for ES8311 DAC.
 

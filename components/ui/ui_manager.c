@@ -9,12 +9,13 @@
 #include "freertos/task.h"
 #include "sdkconfig.h"
 #include "ui_pages.h"
+#include "ui_lvgl.h"
 
 static const char *TAG = "guardian_ui";
 
 #define UI_EVENT_MIN_CONFIDENCE 55
 #define UI_EVENT_MIN_DURATION_SEC 3
-#define UI_EVENT_COOLDOWN_SEC 30
+#define UI_EVENT_COOLDOWN_SEC 10
 
 typedef struct {
     ui_model_t model;
@@ -27,6 +28,7 @@ typedef struct {
     char summary_text[360];
     char homework_text[120];
     char course_title[64];
+    char identity_name[32];
 } ui_state_storage_t;
 
 typedef struct {
@@ -93,6 +95,7 @@ static void bind_model_strings(void)
     s_state.model.summary_text = s_state.summary_text;
     s_state.model.homework_text = s_state.homework_text;
     s_state.model.course_title = s_state.course_title;
+    s_state.model.identity_name = s_state.identity_name;
 }
 
 static void bind_event_strings(void)
@@ -111,6 +114,9 @@ static void set_default_model(void)
     s_state.model.risk_level = 1;
     s_state.model.study_seconds = 0;
     s_state.model.event_duration_seconds = 0;
+    s_state.model.current_focus_seconds = 0;
+    s_state.model.total_focus_seconds = 0;
+    copy_text(s_state.identity_name, sizeof(s_state.identity_name), "", "");
 
     copy_text(s_state.seat_state, sizeof(s_state.seat_state), "检测中", "检测中");
     copy_text(s_state.screen_state, sizeof(s_state.screen_state), "等待课程开始", "等待课程开始");
@@ -169,6 +175,9 @@ static void copy_model(const ui_model_t *model)
     s_state.model.risk_level = model->risk_level;
     s_state.model.study_seconds = model->study_seconds;
     s_state.model.event_duration_seconds = model->event_duration_seconds;
+    s_state.model.current_focus_seconds = model->current_focus_seconds;
+    s_state.model.total_focus_seconds = model->total_focus_seconds;
+    copy_text(s_state.identity_name, sizeof(s_state.identity_name), model->identity_name, "");
 
     copy_text(s_state.seat_state, sizeof(s_state.seat_state), model->seat_state, "检测中");
     copy_text(s_state.screen_state, sizeof(s_state.screen_state), model->screen_state, "检测中");
@@ -203,6 +212,9 @@ static bool model_changed(const ui_model_t *a, const ui_model_t *b)
            a->risk_level != b->risk_level ||
            a->study_seconds != b->study_seconds ||
            a->event_duration_seconds != b->event_duration_seconds ||
+           a->current_focus_seconds != b->current_focus_seconds ||
+           a->total_focus_seconds != b->total_focus_seconds ||
+           text_changed(a->identity_name, b->identity_name) ||
            text_changed(a->seat_state, b->seat_state) ||
            text_changed(a->screen_state, b->screen_state) ||
            text_changed(a->pose_state, b->pose_state) ||
@@ -422,6 +434,28 @@ void ui_manager_show_page(ui_page_t page)
 
     s_current_mode = page;
     render_locked();
+    give_lock();
+}
+
+void ui_manager_update_timer(uint32_t current_seconds, uint32_t total_seconds)
+{
+    if (!s_inited) {
+        ui_manager_init();
+    }
+
+    if (!take_lock()) {
+        return;
+    }
+
+    s_state.model.current_focus_seconds = current_seconds;
+    s_state.model.total_focus_seconds = total_seconds;
+
+#if CONFIG_UI_MANAGER_USE_LVGL
+    ui_lvgl_update_timer(current_seconds, total_seconds);
+#else
+    render_locked();
+#endif
+
     give_lock();
 }
 
