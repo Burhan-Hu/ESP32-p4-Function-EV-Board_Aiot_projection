@@ -1,8 +1,6 @@
 ﻿build/
-build2/
-build_export.log
-build2_export.log
-sdkconfig
-sdkconfig.old
-sdkconfig.defaults.*
-managed_components/managed_components/
+managed_components/
+*.pyd
+*.dll
+.venv/
+.venv_train/
