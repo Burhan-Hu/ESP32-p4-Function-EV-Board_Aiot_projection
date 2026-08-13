@@ -1,6 +1,52 @@
-﻿build/
+# Build products
+build/
+build-*/
 managed_components/
-*.pyd
+*.elf
+*.bin
+*.map
+*.o
+*.obj
+*.a
+*.so
 *.dll
+*.pyd
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
 .venv/
 .venv_train/
+venv/
+
+# Datasets
+/data/
+**/dataset/
+**/dataset_raw/
+**/datasets_raw/
+
+# Models and training outputs
+training/**/outputs*/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.tflite
+*.engine
+*.weights
+*.npy
+*.npz
+!training/osnet_reid/outputs/
+training/osnet_reid/outputs/*
+!training/osnet_reid/outputs/checkpoint_epoch30.pth
+
+# Archives and temporary files
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tmp
+tools_temp/

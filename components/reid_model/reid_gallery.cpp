@@ -24,7 +24,26 @@ static const char *TAG = "reid_gallery";
 #define REID_GALLERY_PATH     "/spiffs/reid_gallery.bin"
 
 static reid_person_t s_gallery[REID_GALLERY_MAX];
-static float s_threshold = 0.65f;
+
+/* Matching strictness: raise this to reduce false-positive matches between
+ * different persons. Lowered from 0.75 to 0.60 to improve recognition rate. */
+static float s_threshold = 0.60f;
+
+/* Similarities below this value are treated as a confident "stranger" and
+ * will create a transient gallery entry. Values between this and s_threshold
+ * are in the "uncertain" band: no match, no new registration. */
+static const float REID_STRANGER_THRESHOLD = 0.45f;
+
+/* Only perform EMA update when the match is strong enough to be confident
+ * (>= low) but not so high that the template is already self-similar
+ * (<= high). This prevents runaway self-feedback and background pollution. */
+static const float REID_UPDATE_BAND_LOW  = 0.82f;
+static const float REID_UPDATE_BAND_HIGH = 0.97f;
+
+/* Small EMA alpha makes the template evolve slowly and avoids drifting
+ * toward a single noisy frame or a different person. */
+static const float REID_EMA_ALPHA = 0.10f;
+
 static int s_next_id = 1;
 static int s_enroll_slot = -1;
 static SemaphoreHandle_t s_mutex = nullptr;
@@ -139,7 +158,7 @@ void reid_gallery_init(void)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     memset(s_gallery, 0, sizeof(s_gallery));
     s_next_id = 1;
-    s_threshold = 0.65f;
+    s_threshold = 0.75f;
     s_enroll_slot = -1;
     reid_gallery_load();
     xSemaphoreGive(s_mutex);
@@ -299,10 +318,19 @@ int reid_gallery_query(const float *feature, float threshold, float *out_similar
             best_idx = i;
         }
     }
+
     int id = -1;
-    if (best_idx >= 0 && best_sim >= threshold) {
-        id = s_gallery[best_idx].person_id;
+    if (best_idx >= 0) {
+        if (best_sim >= threshold) {
+            id = s_gallery[best_idx].person_id;
+        } else if (best_sim <= REID_STRANGER_THRESHOLD) {
+            /* Confidently different from everyone in the gallery. */
+            id = 0;
+        }
+        /* Values between REID_STRANGER_THRESHOLD and threshold remain -1:
+         * "uncertain / unknown". */
     }
+
     if (out_similarity) {
         *out_similarity = (best_idx >= 0) ? best_sim : 0.0f;
     }
@@ -357,9 +385,8 @@ bool reid_gallery_update_person(int person_id, const float *feature, uint32_t no
         return false;
     }
     float sim = cosine_similarity(feature, p->feature);
-    const float alpha = 0.5f;
     for (int i = 0; i < REID_FEATURE_DIM; ++i) {
-        p->feature[i] = (1.0f - alpha) * p->feature[i] + alpha * feature[i];
+        p->feature[i] = (1.0f - REID_EMA_ALPHA) * p->feature[i] + REID_EMA_ALPHA * feature[i];
     }
     l2_normalize(p->feature);
     p->last_seen_ms = now_ms;
@@ -413,15 +440,12 @@ int reid_gallery_update(const float *feature, uint32_t now_ms, float *out_simila
 
     if (best_idx >= 0 && best_sim >= s_threshold) {
         reid_person_t *p = &s_gallery[best_idx];
-        /* Only absorb the new feature into the template when the similarity is
-         * in the [0.85, 0.90] band: high enough to be confident it is the same
-         * person, but not so high that it signals template self-feedback. This
-         * stops background false-positive features from polluting the template
-         * (the runaway sim -> 0.99 seen in testing). */
-        if (best_sim >= 0.85f && best_sim <= 0.90f) {
-            const float alpha = 0.5f;
+        /* Only absorb the new feature when the match is confident enough to be
+         * the same person, but not so self-similar that it is just template
+         * self-feedback. Slow EMA prevents drift and false-positive poisoning. */
+        if (best_sim >= REID_UPDATE_BAND_LOW && best_sim <= REID_UPDATE_BAND_HIGH) {
             for (int i = 0; i < REID_FEATURE_DIM; ++i) {
-                p->feature[i] = (1.0f - alpha) * p->feature[i] + alpha * feature[i];
+                p->feature[i] = (1.0f - REID_EMA_ALPHA) * p->feature[i] + REID_EMA_ALPHA * feature[i];
             }
             l2_normalize(p->feature);
         }
@@ -437,35 +461,13 @@ int reid_gallery_update(const float *feature, uint32_t now_ms, float *out_simila
         return id;
     }
 
-    int slot = find_or_alloc_slot();
-    if (slot < 0) {
-        xSemaphoreGive(s_mutex);
-        if (out_similarity) {
-            *out_similarity = 0.0f;
-        }
-        ESP_LOGW(TAG, "gallery full, cannot register new person");
-        return -1;
-    }
-
-    reid_person_t *p = &s_gallery[slot];
-    p->active = true;
-    p->person_id = s_next_id++;
-    std::strncpy(p->name, "陌生人", sizeof(p->name));
-    p->name[REID_MAX_NAME_LEN] = '\0';
-    p->view = REID_VIEW_UNKNOWN;
-    std::memcpy(p->feature, feature, sizeof(p->feature));
-    p->total_focus_seconds = 0;
-    p->last_seen_ms = now_ms;
-    p->hit_count = 1;
-
-    if (out_similarity) {
-        *out_similarity = 0.0f;
-    }
-    int id = p->person_id;
+    /* No match above threshold: return -1. Strangers are deliberately NOT
+     * registered into the gallery; they have no fixed feature to track. */
     xSemaphoreGive(s_mutex);
-    ESP_LOGI(TAG, "new person id=%d registered (gallery=%d/%d), best_sim=%.4f",
-             id, reid_gallery_count(), REID_GALLERY_MAX, best_sim);
-    return id;
+    if (out_similarity) {
+        *out_similarity = (best_idx >= 0) ? best_sim : 0.0f;
+    }
+    return -1;
 }
 
 void reid_gallery_add_focus_seconds(int person_id, uint32_t seconds)
@@ -634,7 +636,16 @@ void reid_gallery_load(void)
     }
 
     s_next_id = header.next_id;
-    s_threshold = header.threshold;
+    /* Sanity-check the persisted threshold. Old galleries may have saved the
+     * previous default 0.65; clamp/upgrade it to the current default if it is
+     * outside a reasonable range. */
+    if (header.threshold < 0.50f || header.threshold > 0.95f) {
+        s_threshold = 0.75f;
+        ESP_LOGW(TAG, "loaded threshold %.3f out of range, using default %.3f",
+                 header.threshold, s_threshold);
+    } else {
+        s_threshold = header.threshold;
+    }
 
     int active = 0;
     for (int i = 0; i < REID_GALLERY_MAX; ++i) {

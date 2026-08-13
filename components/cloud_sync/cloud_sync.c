@@ -2,18 +2,21 @@
  * Cloud sync worker: SNTP time sync + asynchronous HTTP event reporting.
  *
  * Events (focus start/end, safety alerts) are pushed into a small queue by
- * the caller and POSTed to a local cloud server by a dedicated task. All
- * sends are best-effort with a short timeout; failures are logged and
+ * the caller and POSTed to the configured Guardian server by a dedicated task.
+ * All sends are best-effort with a short timeout; failures are logged and
  * dropped so the detection/UI pipeline is never blocked.
  */
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <inttypes.h>
+#include <limits.h>
 #include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
+#include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_sntp.h"
 #include "cJSON.h"
@@ -32,19 +35,62 @@ typedef enum {
     SYNC_EVT_FOCUS_START = 0,
     SYNC_EVT_FOCUS_END,
     SYNC_EVT_ALERT,
+    SYNC_EVT_FAMILY,
 } sync_evt_type_t;
 
 typedef struct {
-    sync_evt_type_t type;
     char     name[NAME_MAX_LEN];       /* person name, or alert type */
     char     detail[DETAIL_MAX_LEN];   /* alert detail text */
     long     start;                    /* epoch seconds */
     long     end;                      /* epoch seconds */
     uint32_t duration;                 /* seconds */
     int      confidence;               /* 0-100 */
+} legacy_sync_event_t;
+
+typedef struct {
+    sync_evt_type_t type;
+    union {
+        legacy_sync_event_t legacy;
+        family_event_t family;
+    } data;
 } sync_event_t;
 
 static QueueHandle_t s_queue = NULL;
+static portMUX_TYPE s_stats_lock = portMUX_INITIALIZER_UNLOCKED;
+static cloud_sync_stats_t s_stats;
+
+static uint32_t increment_counter(uint32_t *counter)
+{
+    portENTER_CRITICAL(&s_stats_lock);
+    if (*counter < UINT32_MAX) {
+        (*counter)++;
+    }
+    uint32_t value = *counter;
+    portEXIT_CRITICAL(&s_stats_lock);
+    return value;
+}
+
+static bool enqueue_event(const sync_event_t *event)
+{
+    if (s_queue == NULL) {
+        uint32_t drops = increment_counter(&s_stats.disabled_drops);
+        if (drops == 1 || (drops % 16U) == 0) {
+            ESP_LOGW(TAG, "cloud sync disabled; dropped event (total=%" PRIu32 ")",
+                     drops);
+        }
+        return false;
+    }
+    if (xQueueSend(s_queue, event, 0) != pdTRUE) {
+        uint32_t drops = increment_counter(&s_stats.queue_full_drops);
+        if (drops == 1 || (drops % 16U) == 0) {
+            ESP_LOGW(TAG, "cloud sync queue full; dropped event (total=%" PRIu32 ")",
+                     drops);
+        }
+        return false;
+    }
+    increment_counter(&s_stats.enqueued_events);
+    return true;
+}
 
 /* -------------------------------------------------------------------------- */
 /* SNTP                                                                       */
@@ -76,13 +122,23 @@ static void sntp_init_and_wait(void)
 static esp_err_t http_post_json(const char *path, const char *json)
 {
     char url[160];
-    snprintf(url, sizeof(url), "%s%s", CONFIG_CLOUD_SYNC_SERVER_URL, path);
+    int written = snprintf(url, sizeof(url), "%s%s",
+                           CONFIG_CLOUD_SYNC_SERVER_URL, path);
+    if (written <= 0 || (size_t)written >= sizeof(url)) {
+        ESP_LOGE(TAG, "server URL is too long for path %s", path);
+        return ESP_ERR_INVALID_SIZE;
+    }
 
     esp_http_client_config_t cfg = {
         .url = url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = HTTP_TIMEOUT_MS,
     };
+    /* Only attach certificate bundle for HTTPS URLs. Plain HTTP must not
+     * attempt TLS negotiation or the server will reset the connection. */
+    if (strncmp(url, "https://", 8) == 0) {
+        cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    }
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (client == NULL) {
         return ESP_FAIL;
@@ -113,23 +169,63 @@ static char *build_json(const sync_event_t *evt)
     if (root == NULL) {
         return NULL;
     }
+    const legacy_sync_event_t *legacy = &evt->data.legacy;
     switch (evt->type) {
     case SYNC_EVT_FOCUS_START:
-        cJSON_AddStringToObject(root, "name", evt->name);
-        cJSON_AddNumberToObject(root, "start", (double)evt->start);
+        cJSON_AddStringToObject(root, "name", legacy->name);
+        cJSON_AddNumberToObject(root, "start", (double)legacy->start);
         break;
     case SYNC_EVT_FOCUS_END:
-        cJSON_AddStringToObject(root, "name", evt->name);
-        cJSON_AddNumberToObject(root, "start", (double)evt->start);
-        cJSON_AddNumberToObject(root, "end", (double)evt->end);
-        cJSON_AddNumberToObject(root, "duration", (double)evt->duration);
+        cJSON_AddStringToObject(root, "name", legacy->name);
+        cJSON_AddNumberToObject(root, "start", (double)legacy->start);
+        cJSON_AddNumberToObject(root, "end", (double)legacy->end);
+        cJSON_AddNumberToObject(root, "duration", (double)legacy->duration);
         break;
+    case SYNC_EVT_FAMILY: {
+        const family_event_t *family = &evt->data.family;
+        cJSON_AddNumberToObject(root, "schema_version", family->schema_version);
+        cJSON_AddStringToObject(root, "event_id", family->event_id);
+        cJSON_AddStringToObject(root, "device_id", family->device_id);
+        cJSON_AddStringToObject(root, "event_type",
+                               family_event_type_name(family->event_type));
+        if (family->person_id > 0) {
+            cJSON_AddNumberToObject(root, "person_id", family->person_id);
+        } else {
+            cJSON_AddNullToObject(root, "person_id");
+        }
+        if (family->person_name[0] != '\0') {
+            cJSON_AddStringToObject(root, "person_name", family->person_name);
+        } else {
+            cJSON_AddNullToObject(root, "person_name");
+        }
+        if (family->session_id[0] != '\0') {
+            cJSON_AddStringToObject(root, "session_id", family->session_id);
+        } else {
+            cJSON_AddNullToObject(root, "session_id");
+        }
+        cJSON_AddNumberToObject(root, "timestamp", (double)family->timestamp);
+        cJSON_AddNumberToObject(root, "focus_seconds", family->focus_seconds);
+        cJSON_AddNumberToObject(root, "absence_seconds", family->absence_seconds);
+        if (family->confidence_valid) {
+            cJSON_AddNumberToObject(root, "confidence", family->confidence);
+        } else {
+            cJSON_AddNullToObject(root, "confidence");
+        }
+        if (family->end_reason_valid) {
+            cJSON_AddStringToObject(root, "end_reason",
+                                   family_focus_end_reason_name(family->end_reason));
+        } else {
+            cJSON_AddNullToObject(root, "end_reason");
+        }
+        cJSON_AddStringToObject(root, "detail", family->detail);
+        break;
+    }
     case SYNC_EVT_ALERT:
     default:
-        cJSON_AddStringToObject(root, "type", evt->name);
-        cJSON_AddNumberToObject(root, "confidence", evt->confidence);
-        cJSON_AddNumberToObject(root, "time", (double)evt->end);
-        cJSON_AddStringToObject(root, "detail", evt->detail);
+        cJSON_AddStringToObject(root, "type", legacy->name);
+        cJSON_AddNumberToObject(root, "confidence", legacy->confidence);
+        cJSON_AddNumberToObject(root, "time", (double)legacy->end);
+        cJSON_AddStringToObject(root, "detail", legacy->detail);
         break;
     }
     char *out = cJSON_PrintUnformatted(root);
@@ -155,6 +251,9 @@ static void sync_task(void *arg)
             break;
         case SYNC_EVT_FOCUS_END:
             http_post_json("/api/focus/end", json);
+            break;
+        case SYNC_EVT_FAMILY:
+            http_post_json("/api/events", json);
             break;
         case SYNC_EVT_ALERT:
         default:
@@ -189,43 +288,61 @@ esp_err_t cloud_sync_init(void)
     return ESP_OK;
 }
 
-void cloud_sync_focus_start(const char *name, time_t start_epoch)
+bool cloud_sync_publish(const family_event_t *event)
 {
-    if (s_queue == NULL) {
+    if (!family_event_validate(event)) {
+        uint32_t drops = increment_counter(&s_stats.invalid_event_drops);
+        ESP_LOGW(TAG, "invalid family event rejected (total=%" PRIu32 ")", drops);
+        return false;
+    }
+
+    sync_event_t queued_event = {0};
+    queued_event.type = SYNC_EVT_FAMILY;
+    queued_event.data.family = *event;  /* fixed arrays: complete deep copy */
+    return enqueue_event(&queued_event);
+}
+
+void cloud_sync_get_stats(cloud_sync_stats_t *out_stats)
+{
+    if (out_stats == NULL) {
         return;
     }
+    portENTER_CRITICAL(&s_stats_lock);
+    *out_stats = s_stats;
+    portEXIT_CRITICAL(&s_stats_lock);
+}
+
+void cloud_sync_focus_start(const char *name, time_t start_epoch)
+{
     sync_event_t evt = {0};
     evt.type = SYNC_EVT_FOCUS_START;
-    strlcpy(evt.name, name ? name : "", sizeof(evt.name));
-    evt.start = (long)(start_epoch > 0 ? start_epoch : time(NULL));
-    xQueueSend(s_queue, &evt, 0);  /* drop silently if the queue is full */
+    legacy_sync_event_t *legacy = &evt.data.legacy;
+    strlcpy(legacy->name, name ? name : "", sizeof(legacy->name));
+    legacy->start = (long)(start_epoch > 0 ? start_epoch : time(NULL));
+    enqueue_event(&evt);
 }
 
 void cloud_sync_focus_end(const char *name, time_t start_epoch,
                           time_t end_epoch, uint32_t duration_sec)
 {
-    if (s_queue == NULL) {
-        return;
-    }
     sync_event_t evt = {0};
     evt.type = SYNC_EVT_FOCUS_END;
-    strlcpy(evt.name, name ? name : "", sizeof(evt.name));
-    evt.start = (long)start_epoch;
-    evt.end = (long)(end_epoch > 0 ? end_epoch : time(NULL));
-    evt.duration = duration_sec;
-    xQueueSend(s_queue, &evt, 0);
+    legacy_sync_event_t *legacy = &evt.data.legacy;
+    strlcpy(legacy->name, name ? name : "", sizeof(legacy->name));
+    legacy->start = (long)start_epoch;
+    legacy->end = (long)(end_epoch > 0 ? end_epoch : time(NULL));
+    legacy->duration = duration_sec;
+    enqueue_event(&evt);
 }
 
 void cloud_sync_alert(const char *type, int confidence, const char *detail)
 {
-    if (s_queue == NULL) {
-        return;
-    }
     sync_event_t evt = {0};
     evt.type = SYNC_EVT_ALERT;
-    strlcpy(evt.name, type ? type : "unknown", sizeof(evt.name));
-    strlcpy(evt.detail, detail ? detail : "", sizeof(evt.detail));
-    evt.end = (long)time(NULL);
-    evt.confidence = confidence;
-    xQueueSend(s_queue, &evt, 0);
+    legacy_sync_event_t *legacy = &evt.data.legacy;
+    strlcpy(legacy->name, type ? type : "unknown", sizeof(legacy->name));
+    strlcpy(legacy->detail, detail ? detail : "", sizeof(legacy->detail));
+    legacy->end = (long)time(NULL);
+    legacy->confidence = confidence;
+    enqueue_event(&evt);
 }

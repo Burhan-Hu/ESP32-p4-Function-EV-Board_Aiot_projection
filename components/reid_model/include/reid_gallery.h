@@ -58,7 +58,9 @@ void reid_gallery_set_threshold(float threshold);
  * @param feature        L2-normalized 128-d feature.
  * @param threshold      Similarity threshold.
  * @param out_similarity Optional output for the best matching similarity.
- * @return Matched person ID (>0), or -1 if no match above threshold.
+ * @return Matched person ID (>0), 0 if the feature is confidently a stranger
+ *         (best similarity below the stranger threshold), or -1 if there is
+ *         no match above threshold (uncertain / empty gallery).
  */
 int reid_gallery_query(const float *feature, float threshold, float *out_similarity);
 
@@ -87,12 +89,13 @@ bool reid_gallery_update_person(int person_id, const float *feature, uint32_t no
  * @brief Compare a new feature against the gallery and return a person ID.
  *
  * If the best match is above the threshold, the existing person is returned.
- * Otherwise a new gallery entry (and new ID) is created.
+ * Strangers are NOT auto-registered into the gallery; they are handled purely
+ * by the caller based on the similarity.
  *
  * @param feature        L2-normalized 128-d feature.
  * @param now_ms         Current timestamp in milliseconds.
  * @param out_similarity Optional output for the best matching similarity.
- * @return Person ID (>0), or -1 if the gallery is full.
+ * @return Person ID (>0), or -1 if no match above threshold.
  */
 int reid_gallery_update(const float *feature, uint32_t now_ms, float *out_similarity);
 

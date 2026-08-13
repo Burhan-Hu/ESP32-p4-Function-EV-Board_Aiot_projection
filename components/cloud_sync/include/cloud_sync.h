@@ -1,13 +1,15 @@
 /*
- * Cloud sync: report focus sessions and safety alerts to a local cloud
- * server over HTTP. All reporting is asynchronous (queue + worker task);
- * failures are silently dropped and never block the main pipeline.
+ * Cloud sync: report focus sessions and safety alerts to the configured
+ * Guardian server over HTTP(S). All reporting is asynchronous (queue + worker task);
+ * failures are counted/logged and never block the main pipeline.
  */
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
 #include "esp_err.h"
+#include "family_events.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,6 +27,26 @@ extern "C" {
  * unreachable: events will simply be dropped on timeout.
  */
 esp_err_t cloud_sync_init(void);
+
+/**
+ * @brief Non-blocking publish of one complete family fact event.
+ *
+ * The event is validated and copied by value into the FreeRTOS queue. This
+ * function never performs HTTP and uses a zero queue wait. It returns false
+ * when cloud sync is disabled/uninitialized, the event is invalid, or the
+ * queue is full.
+ */
+bool cloud_sync_publish(const family_event_t *event);
+
+typedef struct {
+    uint32_t enqueued_events;
+    uint32_t disabled_drops;
+    uint32_t queue_full_drops;
+    uint32_t invalid_event_drops;
+} cloud_sync_stats_t;
+
+/** Copy current enqueue/drop counters. */
+void cloud_sync_get_stats(cloud_sync_stats_t *out_stats);
 
 /**
  * @brief Report that a focus session has started.

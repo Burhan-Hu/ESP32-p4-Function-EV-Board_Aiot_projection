@@ -1,0 +1,49 @@
+menu "Family Link (guardian short voice downlink)"
+
+    config FAMILY_LINK_ENABLE
+        bool "Enable guardian short voice downlink"
+        default n
+        depends on !AUDIO_ENABLE_LOOPBACK_TEST
+        help
+            Start the independent heartbeat / command-poll worker. This is
+            disabled by default until it has been verified on real hardware.
+
+    config FAMILY_LINK_SERVER_URL
+        string "Guardian server base URL"
+        default "https://guardian.example.com"
+        help
+            Public HTTPS origin used for heartbeat, command polling, audio,
+            and ACK requests. Replace the placeholder and omit a trailing
+            slash. Plain HTTP remains supported for a controlled local demo.
+
+    config FAMILY_LINK_POLL_INTERVAL_MS
+        int "Command poll interval (milliseconds)"
+        default 2000
+        range 1000 10000
+
+    config FAMILY_LINK_HEARTBEAT_INTERVAL_MS
+        int "Heartbeat interval (milliseconds)"
+        default 10000
+        range 5000 60000
+
+    config FAMILY_LINK_HTTP_TIMEOUT_MS
+        int "HTTP request timeout (milliseconds)"
+        default 10000
+        range 3000 30000
+
+    config FAMILY_LINK_RETRY_INITIAL_MS
+        int "Initial network retry delay (milliseconds)"
+        default 1000
+        range 500 5000
+
+    config FAMILY_LINK_RETRY_MAX_MS
+        int "Maximum network retry delay (milliseconds)"
+        default 10000
+        range 2000 60000
+
+    config FAMILY_LINK_TASK_STACK_SIZE
+        int "Worker task stack size (bytes)"
+        default 8192
+        range 6144 16384
+
+endmenu

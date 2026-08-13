@@ -36,6 +36,8 @@
 #include "audio.h"
 #include "cloud_api.h"
 #include "cloud_sync.h"
+#include "family_events.h"
+#include "family_link.h"
 #include "pir.h"
 #include "camera_capture.h"
 #include "human_detect.h"
@@ -48,6 +50,48 @@
 #endif
 
 static const char *TAG = "mipi_isp_dsi";
+
+#if CONFIG_FAMILY_LINK_ENABLE
+static esp_err_t family_voice_playback(const int16_t *pcm,
+                                       size_t sample_count,
+                                       void *user_ctx)
+{
+    const bool *audio_ready = (const bool *)user_ctx;
+    if (audio_ready == NULL || !*audio_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return audio_play_pcm(pcm, sample_count);
+}
+#endif
+
+#define FAMILY_VALID_EPOCH_MIN 1700000000LL
+#define FAMILY_PENDING_START_TTL_MS 15000U
+
+static int64_t family_timestamp_now(void)
+{
+    int64_t now = (int64_t)time(NULL);
+    return now >= FAMILY_VALID_EPOCH_MIN ? now : 0;
+}
+
+typedef struct {
+    bool active;
+    int person_id;
+    uint32_t requested_tick_ms;
+} family_pending_start_t;
+
+static portMUX_TYPE s_family_pending_start_lock = portMUX_INITIALIZER_UNLOCKED;
+static family_pending_start_t s_family_pending_start;
+
+static bool family_tick_elapsed(uint32_t start_tick_ms, uint32_t end_tick_ms,
+                                uint32_t *out_elapsed_ms)
+{
+    int32_t delta = (int32_t)(end_tick_ms - start_tick_ms);
+    if (delta < 0 || out_elapsed_ms == NULL) {
+        return false;
+    }
+    *out_elapsed_ms = (uint32_t)delta;
+    return true;
+}
 
 static esp_cam_ctlr_handle_t s_cam_handle = NULL;
 static int s_cam_width = 0;
@@ -63,9 +107,8 @@ static ui_model_t s_ui_model;
 /* Re-ID / focus session state */
 static int s_current_person_id = -1;
 static char s_current_identity_name[REID_MAX_NAME_LEN + 1] = {0};
-static uint32_t s_study_start_ms = 0;
-static time_t s_study_start_epoch = 0;
-static bool s_study_active = false;
+static bool s_current_reid_similarity_valid = false;
+static float s_current_reid_similarity = 0.0f;
 static bool s_enrolling = false;
 static char s_enroll_name[REID_MAX_NAME_LEN + 1] = {0};
 static int s_monitor_whitelist_id = -1;
@@ -74,19 +117,35 @@ static int s_monitor_whitelist_id = -1;
  * a rate limiter so Re-ID inference does not run on every detection frame. */
 static bool s_detected_person_now = false;
 
-/* Cosine-similarity threshold for accepting a Re-ID match. Adjust this single
- * value to re-tune the match strictness. */
-#define REID_MATCH_THRESHOLD 0.65f
+/* Multi-frame consistency: require N consecutive frames with the same identity
+ * before the UI/state machine accepts it. This suppresses single-frame
+ * recognition jitter. */
+#define REID_IDENTITY_HISTORY_LEN   3
+#define REID_IDENTITY_CONFIRM_COUNT 3
+
+/* Re-ID identity history for multi-frame consistency voting. Each slot stores
+ * the raw per-frame identity: -1 = unknown, 0 = stranger, >0 = enrolled id. */
+static int s_reid_history[REID_IDENTITY_HISTORY_LEN] = {-1};
+static int s_reid_history_idx = 0;
+static int s_confirmed_identity = -1;
+
+/* Cosine-similarity threshold for accepting a Re-ID match. Raised from 0.65 to
+ * 0.75 to reduce false-positive matches between different persons. */
+#define REID_MATCH_THRESHOLD 0.60f
+
+/* Multi-frame consistency: require N consecutive frames with the same identity
+ * before the UI/state machine accepts it. This suppresses single-frame
+ * recognition jitter. */
 
 /* Confidence (detection score) of the most recent confirmed person frame,
  * used as the "疑似离座" event confidence instead of a hard-coded value. */
 static float s_last_detect_score = 0.0f;
 
-/* Fallback leave-seat alert: fires when the frame has been continuously
+/* Fallback leave-seat UI alert: fires when the frame has been continuously
  * "unrecognized" for ABSENT_ALERT_TIMEOUT_MS, regardless of whether debounced
  * presence (s_present) was ever asserted. This covers the case where the
  * person was never detected, so the present->absent edge never occurs and
- * on_human_left would never fire. */
+ * on_human_left would never fire. It is not a family LONG_ABSENCE fact. */
 static uint32_t s_absent_since_ms = 0;
 static bool s_absent_alerted = false;
 #define ABSENT_ALERT_TIMEOUT_MS 3000
@@ -218,6 +277,15 @@ static bool monitor_is_active(void)
     return active;
 }
 
+static void monitor_forget_whitelist(int person_id)
+{
+    xSemaphoreTake(s_monitor_mutex, portMAX_DELAY);
+    if (person_id <= 0 || s_monitor_whitelist_id == person_id) {
+        s_monitor_whitelist_id = -1;
+    }
+    xSemaphoreGive(s_monitor_mutex);
+}
+
 static bool extract_reid_feature(float *feature_out);
 
 static bool monitor_is_command(const char *text, bool *start_out)
@@ -263,10 +331,13 @@ static void monitor_set_reference(const uint8_t *jpeg, size_t len)
     s_monitor_ref_jpeg_len = len;
 }
 
-static void focus_stop(bool save);
+static void focus_stop_guarded(family_focus_end_reason_t reason, bool save,
+                               const family_session_guard_t *expected_session);
+static void family_pending_start_clear(int person_id);
 
 static void monitor_start(void)
 {
+    family_pending_start_clear(-1);
     xSemaphoreTake(s_monitor_mutex, portMAX_DELAY);
     s_monitor_state = MONITOR_STATE_ACTIVE;
     s_monitor_deadline_ms = xTaskGetTickCount() * portTICK_PERIOD_MS + MONITOR_DEFAULT_DURATION_MS;
@@ -282,9 +353,16 @@ static void monitor_start(void)
             float sim = 0.0f;
             int id = reid_gallery_query(feature, REID_MATCH_THRESHOLD, &sim);
             if (id > 0) {
-                s_monitor_whitelist_id = id;
-                ESP_LOGI(TAG, "monitor whitelist set to %s (id=%d, sim=%.4f)",
-                         reid_gallery_get_name(id), id, sim);
+                xSemaphoreTake(s_monitor_mutex, portMAX_DELAY);
+                bool monitor_active = s_monitor_state == MONITOR_STATE_ACTIVE;
+                if (monitor_active) {
+                    s_monitor_whitelist_id = id;
+                }
+                xSemaphoreGive(s_monitor_mutex);
+                if (monitor_active) {
+                    ESP_LOGI(TAG, "monitor whitelist set to %s (id=%d, sim=%.4f)",
+                             reid_gallery_get_name(id), id, sim);
+                }
             } else {
                 ESP_LOGW(TAG, "monitor: could not identify current person for whitelist");
             }
@@ -293,8 +371,9 @@ static void monitor_start(void)
 
     /* Stop any active focus session: the user is intentionally leaving the
      * seat for monitoring, so this must not be reported as a leave-seat event. */
-    if (s_study_active) {
-        focus_stop(true);
+    family_session_guard_t session_guard;
+    if (family_events_get_session_guard(&session_guard)) {
+        focus_stop_guarded(FAMILY_FOCUS_END_OTHER, true, &session_guard);
     }
 }
 
@@ -320,7 +399,9 @@ static void on_human_present(void);
 static void on_human_left_reminder(uint32_t absent_ms);
 
 static void focus_start(int person_id);
-static void focus_stop(bool save);
+static void focus_stop(family_focus_end_reason_t reason, bool save);
+static void focus_stop_guarded(family_focus_end_reason_t reason, bool save,
+                               const family_session_guard_t *expected_session);
 static void update_focus_ui(void);
 static bool parse_enroll_name(const char *text, char *name, size_t name_len);
 static bool handle_voice_command(const char *text);
@@ -329,6 +410,51 @@ static void focus_report(void);
 static bool handle_clear_command(const char *text);
 static void on_detect_frame(bool detected, const uint8_t *rgb565, int w, int h,
                             int x1, int y1, int x2, int y2, float score);
+
+static void finish_focus_end_event(const family_event_t *end_event, bool save);
+static void handle_family_owner_observation(
+    family_owner_observation_kind_t kind, int person_id,
+    bool similarity_valid, float similarity, uint32_t now_ms);
+
+static void family_pending_start_clear(int person_id)
+{
+    portENTER_CRITICAL(&s_family_pending_start_lock);
+    if (person_id <= 0 ||
+        (s_family_pending_start.active &&
+         s_family_pending_start.person_id == person_id)) {
+        memset(&s_family_pending_start, 0, sizeof(s_family_pending_start));
+    }
+    portEXIT_CRITICAL(&s_family_pending_start_lock);
+}
+
+static void family_pending_start_set(int person_id, uint32_t now_ms)
+{
+    portENTER_CRITICAL(&s_family_pending_start_lock);
+    s_family_pending_start.active = true;
+    s_family_pending_start.person_id = person_id;
+    s_family_pending_start.requested_tick_ms = now_ms;
+    portEXIT_CRITICAL(&s_family_pending_start_lock);
+}
+
+static bool family_pending_start_take(int person_id, uint32_t now_ms)
+{
+    bool take = false;
+    portENTER_CRITICAL(&s_family_pending_start_lock);
+    if (s_family_pending_start.active) {
+        uint32_t age_ms = 0;
+        bool time_valid = family_tick_elapsed(
+            s_family_pending_start.requested_tick_ms, now_ms, &age_ms);
+        if (time_valid && age_ms > FAMILY_PENDING_START_TTL_MS) {
+            memset(&s_family_pending_start, 0, sizeof(s_family_pending_start));
+        } else if (time_valid &&
+                   s_family_pending_start.person_id == person_id) {
+            take = true;
+            memset(&s_family_pending_start, 0, sizeof(s_family_pending_start));
+        }
+    }
+    portEXIT_CRITICAL(&s_family_pending_start_lock);
+    return take;
+}
 
 /* Return true if the user question likely requires visual information. */
 static bool question_needs_camera(const char *text)
@@ -420,10 +546,12 @@ static void update_focus_ui(void)
     uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     uint32_t current_sec = 0;
     uint32_t total_sec = 0;
+    family_study_session_t study_session;
+    bool study_active = family_events_get_study_session(&study_session);
 
-    if (s_study_active && s_current_person_id > 0) {
-        current_sec = (now - s_study_start_ms) / 1000;
-        const reid_person_t *p = reid_gallery_find_by_id(s_current_person_id);
+    if (study_active) {
+        current_sec = (now - study_session.start_tick_ms) / 1000;
+        const reid_person_t *p = reid_gallery_find_by_id(study_session.person_id);
         if (p) {
             total_sec = p->total_focus_seconds + current_sec;
         }
@@ -460,43 +588,87 @@ static void focus_start(int person_id)
         speak_text("未识别到注册身份，无法开始计时。");
         return;
     }
-    if (s_study_active) {
-        if (s_current_person_id == person_id) {
-            speak_text("已经在学习计时中。");
-            return;
-        }
-        focus_stop(true);
+
+    const reid_person_t *person = reid_gallery_find_by_id(person_id);
+    if (person == NULL || person->name[0] == '\0') {
+        speak_text("未找到注册身份，无法开始计时。");
+        return;
+    }
+    char owner_name[REID_MAX_NAME_LEN + 1];
+    strlcpy(owner_name, person->name, sizeof(owner_name));
+    int similarity_person_id_before = s_current_person_id;
+    bool similarity_valid = s_current_reid_similarity_valid;
+    float similarity = s_current_reid_similarity;
+    int similarity_person_id_after = s_current_person_id;
+    similarity_valid = similarity_valid &&
+                       similarity_person_id_before == person_id &&
+                       similarity_person_id_after == person_id;
+    if (!similarity_valid) {
+        similarity = 0.0f;
     }
 
-    s_current_person_id = person_id;
-    s_study_start_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-    s_study_active = true;
-    s_ui_model.screen_state = "正在学习中";
-    strlcpy(s_current_identity_name, reid_gallery_get_name(person_id),
-            sizeof(s_current_identity_name));
-    s_study_start_epoch = time(NULL);
-    cloud_sync_focus_start(s_current_identity_name, s_study_start_epoch);
-    speak_text("开始学习，加油！");
-    ESP_LOGI(TAG, "focus started for %s (id=%d)", s_current_identity_name, person_id);
-    update_focus_ui();
-}
+    family_event_t start_event;
+    family_session_guard_t conflicting_session;
+    family_session_start_result_t start_result = FAMILY_SESSION_START_INVALID;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        uint32_t start_tick_ms =
+            (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        start_result = family_events_start_session(
+            person_id, owner_name, start_tick_ms, family_timestamp_now(),
+            similarity_valid, similarity, &start_event,
+            &conflicting_session);
+        if (start_result != FAMILY_SESSION_START_OTHER_ACTIVE || attempt > 0) {
+            break;
+        }
+        /* Explicitly switching learners ends the current session without
+         * creating an absence; the family mutex still permits only one END. */
+        focus_stop_guarded(FAMILY_FOCUS_END_OTHER, true,
+                           &conflicting_session);
+    }
 
-static void focus_stop(bool save)
-{
-    if (!s_study_active) {
-        s_study_active = false;
-        s_current_person_id = -1;
-        s_current_identity_name[0] = '\0';
-        s_ui_model.screen_state = "等待课程开始";
-        update_focus_ui();
+    if (start_result == FAMILY_SESSION_START_ALREADY_ACTIVE) {
+        family_pending_start_clear(person_id);
+        speak_text("已经在学习计时中。");
+        return;
+    }
+    if (start_result == FAMILY_SESSION_START_RETURN_CONFIRM_PENDING) {
+        uint32_t pending_tick_ms =
+            (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        family_pending_start_set(person_id, pending_tick_ms);
+        ESP_LOGI(TAG, "focus start waiting for two-frame return confirmation, id=%d",
+                 person_id);
+        speak_text("正在确认你已返回座位，请稍候。");
+        return;
+    }
+    if (start_result != FAMILY_SESSION_START_OK) {
+        ESP_LOGE(TAG, "failed to create family study session for id=%d", person_id);
+        speak_text("学习状态初始化失败，无法开始计时。");
         return;
     }
 
-    uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-    uint32_t duration_sec = (now - s_study_start_ms) / 1000;
+    /* A newer successful start supersedes any older pending learner intent. */
+    family_pending_start_clear(-1);
+    s_current_person_id = person_id;
+    s_ui_model.screen_state = "正在学习中";
+    strlcpy(s_current_identity_name, owner_name,
+            sizeof(s_current_identity_name));
+    bool queued = cloud_sync_publish(&start_event);
+    speak_text("开始学习，加油！");
+    ESP_LOGI(TAG, "focus started for %s (id=%d, session=%s, queued=%d)",
+             s_current_identity_name, person_id, start_event.session_id, queued);
+    update_focus_ui();
+}
 
-    if (save && s_current_person_id > 0 && duration_sec > 0) {
-        reid_gallery_add_focus_seconds(s_current_person_id, duration_sec);
+static void finish_focus_end_event(const family_event_t *end_event, bool save)
+{
+    if (end_event == NULL || end_event->event_type != FAMILY_EVENT_FOCUS_END) {
+        return;
+    }
+
+    uint32_t duration_sec = end_event->focus_seconds;
+
+    if (save && end_event->person_id > 0 && duration_sec > 0) {
+        reid_gallery_add_focus_seconds(end_event->person_id, duration_sec);
     }
 
     if (duration_sec > 0) {
@@ -506,19 +678,89 @@ static void focus_stop(bool save)
         speak_text(msg);
     }
 
-    if (s_current_person_id > 0 && duration_sec > 0) {
-        cloud_sync_focus_end(s_current_identity_name, s_study_start_epoch,
-                             time(NULL), duration_sec);
-    }
+    bool queued = cloud_sync_publish(end_event);
 
-    ESP_LOGI(TAG, "focus stopped for %s (id=%d), duration=%" PRIu32 "s, saved=%d",
-             s_current_identity_name, s_current_person_id, duration_sec, save);
+    ESP_LOGI(TAG, "focus stopped for %s (id=%d, session=%s), duration=%" PRIu32
+             "s, reason=%s, saved=%d, queued=%d",
+             end_event->person_name, end_event->person_id, end_event->session_id,
+             duration_sec,
+             family_focus_end_reason_name(end_event->end_reason), save, queued);
 
-    s_study_active = false;
     s_current_person_id = -1;
     s_current_identity_name[0] = '\0';
+    s_current_reid_similarity_valid = false;
+    s_current_reid_similarity = 0.0f;
     s_ui_model.screen_state = "等待课程开始";
     update_focus_ui();
+}
+
+static void focus_stop_guarded(family_focus_end_reason_t reason, bool save,
+                               const family_session_guard_t *expected_session)
+{
+    family_pending_start_clear(-1);
+    if (expected_session == NULL || !expected_session->active) {
+        return;
+    }
+    uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    family_event_t end_event;
+    if (family_events_end_session(expected_session, now, family_timestamp_now(),
+                                  reason, &end_event)) {
+        finish_focus_end_event(&end_event, save);
+    }
+}
+
+static void focus_stop(family_focus_end_reason_t reason, bool save)
+{
+    family_session_guard_t session_guard;
+    if (family_events_get_session_guard(&session_guard)) {
+        focus_stop_guarded(reason, save, &session_guard);
+    } else {
+        family_pending_start_clear(-1);
+    }
+}
+
+static void handle_family_owner_observation(
+    family_owner_observation_kind_t kind, int person_id,
+    bool similarity_valid, float similarity, uint32_t now_ms)
+{
+    family_owner_observation_result_t result = {0};
+    if (!family_events_observe_owner(kind, person_id,
+                                     similarity_valid, similarity,
+                                     now_ms, family_timestamp_now(), &result)) {
+        return;
+    }
+
+    if (result.focus_end_valid) {
+        ESP_LOGI(TAG, "study owner missing: %s (id=%d, evidence=%s)",
+                 result.focus_end.person_name, result.focus_end.person_id,
+                 result.focus_end.detail);
+        finish_focus_end_event(&result.focus_end, true);
+    }
+    if (result.long_absence_valid) {
+        bool queued = cloud_sync_publish(&result.long_absence);
+        ESP_LOGI(TAG, "long absence emitted before return for %s "
+                 "(id=%d, session=%s, absence=%" PRIu32 "s, queued=%d)",
+                 result.long_absence.person_name,
+                 result.long_absence.person_id,
+                 result.long_absence.session_id,
+                 result.long_absence.absence_seconds, queued);
+    }
+    if (result.seat_return_valid) {
+        bool queued = cloud_sync_publish(&result.seat_return);
+        ESP_LOGI(TAG, "seat return confirmed for %s (id=%d, session=%s, "
+                 "absence=%" PRIu32 "s, queued=%d)",
+                 result.seat_return.person_name,
+                 result.seat_return.person_id,
+                 result.seat_return.session_id,
+                 result.seat_return.absence_seconds, queued);
+
+        /* A prior explicit start request is an intent, never a ReID match.
+         * Only after this second independent frame has produced SEAT_RETURN do
+         * we consume the bounded intent and create the new FOCUS_START. */
+        if (family_pending_start_take(result.seat_return.person_id, now_ms)) {
+            focus_start(result.seat_return.person_id);
+        }
+    }
 }
 
 static void focus_tick_task(void *arg)
@@ -528,9 +770,34 @@ static void focus_tick_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(1000));
         uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 
-        /* Fallback leave-seat alert: if the frame has been "unrecognized" for a
-         * while, surface the alert even when debounced presence was never
-         * asserted (so on_human_left never fires, e.g. person never detected). */
+        /* Family absence maintenance is independent of human_detect's single
+         * reminder, which monitor mode may intentionally suppress. A small
+         * output batch is safe: additional due contexts remain pending and are
+         * materialized on the next one-second tick. */
+        family_event_t maintenance_events[2];
+        uint32_t expired_absences = 0;
+        size_t maintenance_count = family_events_maintain(
+            now, family_timestamp_now(), maintenance_events,
+            sizeof(maintenance_events) / sizeof(maintenance_events[0]),
+            &expired_absences);
+        for (size_t i = 0; i < maintenance_count; ++i) {
+            bool queued = cloud_sync_publish(&maintenance_events[i]);
+            ESP_LOGI(TAG, "long absence emitted for %s (id=%d, session=%s, "
+                     "absence=%" PRIu32 "s, queued=%d)",
+                     maintenance_events[i].person_name,
+                     maintenance_events[i].person_id,
+                     maintenance_events[i].session_id,
+                     maintenance_events[i].absence_seconds, queued);
+        }
+        if (expired_absences > 0) {
+            ESP_LOGI(TAG, "expired %" PRIu32
+                     " stale family absence context(s) at safety TTL",
+                     expired_absences);
+        }
+
+        /* Fallback local UI alert: this is deliberately not promoted to a
+         * family event because a short raw-detection miss is not a confirmed
+         * long absence. */
         if (!s_detected_person_now && !monitor_is_active()) {
             if (s_absent_since_ms == 0) {
                 s_absent_since_ms = now;
@@ -551,8 +818,6 @@ static void focus_tick_task(void *arg)
                     .timestamp_seconds = (now - s_absent_since_ms) / 1000,
                 };
                 ui_manager_push_event(&leave_event);
-                cloud_sync_alert(CLOUD_SYNC_ALERT_LEAVE_SEAT, conf,
-                                 "持续未识别，疑似离座");
                 ESP_LOGI(TAG, "absent alert fired after %" PRIu32 " ms unrecognized",
                          now - s_absent_since_ms);
             }
@@ -565,13 +830,16 @@ static void focus_tick_task(void *arg)
             if (s_current_person_id > 0) {
                 s_current_person_id = -1;
                 s_current_identity_name[0] = '\0';
+                s_current_reid_similarity_valid = false;
+                s_current_reid_similarity = 0.0f;
                 update_focus_ui();
                 ui_manager_update(&s_ui_model);
                 ESP_LOGI(TAG, "focus tick: no person detected, cleared cached identity");
             }
         }
 
-        if (s_study_active) {
+        family_study_session_t study_session;
+        if (family_events_get_study_session(&study_session)) {
             update_focus_ui();
             ui_manager_update_timer(s_ui_model.current_focus_seconds,
                                     s_ui_model.total_focus_seconds);
@@ -603,7 +871,7 @@ static bool parse_enroll_name(const char *text, char *name, size_t name_len)
     }
     const char *p = prefix + (prefix == strstr(text, "我叫") ? strlen("我叫") : strlen("我是"));
     while (*p != '\0') {
-        if (*p == ' ' || *p == ',') {
+        if (*p == '\0' || *p == ',') {
             p++;
         } else if (is_utf8_comma(p)) {
             p += 3;
@@ -616,7 +884,7 @@ static bool parse_enroll_name(const char *text, char *name, size_t name_len)
     }
     size_t len = 0;
     while (*p != '\0' && len + 1 < name_len) {
-        if (*p == ' ' || *p == ',' || *p == '.' || *p == '\n' || *p == '\r' ||
+        if (*p == '\0' || *p == ',' || *p == '.' || *p == '\n' || *p == '\r' ||
             is_utf8_comma(p) || is_utf8_period(p)) {
             break;
         }
@@ -650,6 +918,8 @@ static void focus_report(void)
         if (s_current_person_id > 0) {
             s_current_person_id = -1;
             s_current_identity_name[0] = '\0';
+            s_current_reid_similarity_valid = false;
+            s_current_reid_similarity = 0.0f;
             update_focus_ui();
             ui_manager_update(&s_ui_model);
             ESP_LOGI(TAG, "focus report: no person detected, cleared cached identity");
@@ -672,11 +942,15 @@ static void focus_report(void)
         s_current_person_id = id;
         strlcpy(s_current_identity_name, reid_gallery_get_name(id),
                 sizeof(s_current_identity_name));
+        s_current_reid_similarity = sim;
+        s_current_reid_similarity_valid = true;
         ESP_LOGI(TAG, "focus report: identified %s (id=%d), sim=%.4f",
                  s_current_identity_name, id, sim);
     } else {
         s_current_person_id = -1;
         s_current_identity_name[0] = '\0';
+        s_current_reid_similarity_valid = false;
+        s_current_reid_similarity = 0.0f;
         update_focus_ui();
         ui_manager_update(&s_ui_model);
         speak_text("未识别到注册身份。");
@@ -691,9 +965,11 @@ static void focus_report(void)
     }
 
     uint32_t current_sec = 0;
-    if (s_study_active && s_current_person_id == p->person_id) {
+    family_study_session_t study_session;
+    if (family_events_get_study_session(&study_session) &&
+        study_session.person_id == p->person_id) {
         uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-        current_sec = (now - s_study_start_ms) / 1000;
+        current_sec = (now - study_session.start_tick_ms) / 1000;
     }
 
     uint32_t total_sec = p->total_focus_seconds + current_sec;
@@ -778,10 +1054,10 @@ static bool parse_clear_command(const char *text, bool *clear_all, bool *reset_f
         p += strlen("我");
     }
 
-    while (p < end && (*p == ' ' || *p == ',' || *p == '.')) {
+    while (p < end && (*p == '\0' || *p == ',' || *p == '.')) {
         p++;
     }
-    while (end > p && (*(end - 1) == ' ' || *(end - 1) == ',' || *(end - 1) == '.')) {
+    while (end > p && (*(end - 1) == '\0' || *(end - 1) == ',' || *(end - 1) == '.')) {
         end--;
     }
 
@@ -805,9 +1081,25 @@ static bool handle_clear_command(const char *text)
     }
 
     if (clear_all) {
+        family_pending_start_clear(-1);
+        family_invalidation_result_t invalidation;
+        uint32_t now_ms =
+            (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        if (!family_events_invalidate_all(now_ms, family_timestamp_now(),
+                                          &invalidation)) {
+            ESP_LOGE(TAG, "failed to invalidate family state before gallery reset");
+            speak_text("家庭学习状态清理失败，暂未清除记录。");
+            return true;
+        }
+        if (invalidation.focus_end_valid) {
+            finish_focus_end_event(&invalidation.focus_end, true);
+        }
+        monitor_forget_whitelist(-1);
         reid_gallery_reset();
         s_current_person_id = -1;
         s_current_identity_name[0] = '\0';
+        s_current_reid_similarity_valid = false;
+        s_current_reid_similarity = 0.0f;
         s_enrolling = false;
         s_enroll_name[0] = '\0';
         update_focus_ui();
@@ -837,6 +1129,8 @@ static bool handle_clear_command(const char *text)
                 s_current_person_id = target_id;
                 strlcpy(s_current_identity_name, reid_gallery_get_name(target_id),
                         sizeof(s_current_identity_name));
+                s_current_reid_similarity = sim;
+                s_current_reid_similarity_valid = true;
                 ESP_LOGI(TAG, "clear command: identified %s (id=%d), sim=%.4f",
                          s_current_identity_name, target_id, sim);
             }
@@ -848,7 +1142,8 @@ static bool handle_clear_command(const char *text)
         return true;
     }
 
-    const char *target_name = reid_gallery_get_name(target_id);
+    char target_name[REID_MAX_NAME_LEN + 1];
+    strlcpy(target_name, reid_gallery_get_name(target_id), sizeof(target_name));
     char msg[64];
     if (reset_focus) {
         reid_gallery_reset_focus_time(target_id);
@@ -858,10 +1153,28 @@ static bool handle_clear_command(const char *text)
         snprintf(msg, sizeof(msg), "已清空 %s 的专注时长。", target_name);
         ESP_LOGI(TAG, "cleared focus time for %s (id=%d)", target_name, target_id);
     } else {
+        family_pending_start_clear(target_id);
+        family_invalidation_result_t invalidation;
+        uint32_t now_ms =
+            (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        if (!family_events_invalidate_person(target_id, now_ms,
+                                             family_timestamp_now(),
+                                             &invalidation)) {
+            ESP_LOGE(TAG, "failed to invalidate family state for id=%d",
+                     target_id);
+            speak_text("家庭学习状态清理失败，暂未删除记录。");
+            return true;
+        }
+        if (invalidation.focus_end_valid) {
+            finish_focus_end_event(&invalidation.focus_end, true);
+        }
+        monitor_forget_whitelist(target_id);
         reid_gallery_delete_person(target_id);
         if (target_id == s_current_person_id) {
             s_current_person_id = -1;
             s_current_identity_name[0] = '\0';
+            s_current_reid_similarity_valid = false;
+            s_current_reid_similarity = 0.0f;
             update_focus_ui();
         }
         snprintf(msg, sizeof(msg), "已删除 %s 的记录。", target_name);
@@ -890,6 +1203,15 @@ static bool handle_voice_command(const char *text)
             speak_text("请站到摄像头前，再对我说记住你。");
             return true;
         }
+        /* Gallery enrollment silently evicts the least-recent slot when full.
+         * Reject here so an active study/absence/monitor owner can never be
+         * replaced without the controlled invalidation paths above. */
+        if (reid_gallery_count() >= REID_GALLERY_MAX) {
+            ESP_LOGW(TAG, "voice enroll rejected: Gallery full (%d/%d)",
+                     reid_gallery_count(), REID_GALLERY_MAX);
+            speak_text("注册失败，Gallery 已满，请先删除不用的身份。");
+            return true;
+        }
         if (reid_gallery_enroll_start(name)) {
             strlcpy(s_enroll_name, name, sizeof(s_enroll_name));
             s_enrolling = true;
@@ -911,7 +1233,7 @@ static bool handle_voice_command(const char *text)
     }
 
     if (strstr(text, "结束学习") || strstr(text, "停止计时") || strstr(text, "不学了")) {
-        focus_stop(true);
+        focus_stop(FAMILY_FOCUS_END_USER_STOP, true);
         return true;
     }
 
@@ -936,6 +1258,40 @@ static bool reid_extract_from_frame(const uint8_t *rgb565, int w, int h,
     return ok;
 }
 
+/* Vote over the last REID_IDENTITY_HISTORY_LEN frames. Returns the identity
+ * that has appeared enough times consecutively, or -2 if no identity has
+ * reached that level of consensus.
+ *
+ * Confirmation thresholds differ by identity type:
+ * - raw_id > 0 (matched person): immediate, handled by caller
+ * - raw_id = 0 (stranger): 2 consecutive frames
+ * - raw_id = -1 (unknown): 3 consecutive frames (default) */
+static int reid_identity_vote(int latest_id)
+{
+    s_reid_history[s_reid_history_idx] = latest_id;
+    s_reid_history_idx = (s_reid_history_idx + 1) % REID_IDENTITY_HISTORY_LEN;
+
+    int required = REID_IDENTITY_CONFIRM_COUNT;
+    if (latest_id == 0) {
+        required = 2;  /* stranger only needs 2 frames */
+    }
+
+    int consecutive = 1;
+    for (int i = 1; i < REID_IDENTITY_HISTORY_LEN; ++i) {
+        int idx = (s_reid_history_idx - 1 - i + REID_IDENTITY_HISTORY_LEN) % REID_IDENTITY_HISTORY_LEN;
+        if (s_reid_history[idx] == latest_id) {
+            ++consecutive;
+        } else {
+            break;
+        }
+    }
+
+    if (consecutive >= required) {
+        return latest_id;
+    }
+    return -2; /* uncertain, keep previous confirmed identity */
+}
+
 /* Match a feature against the gallery (or feed an ongoing enrollment) and
  * update s_current_person_id / s_current_identity_name accordingly. */
 static void reid_match_and_set_identity(const float *feature, uint32_t now_ms)
@@ -951,6 +1307,8 @@ static void reid_match_and_set_identity(const float *feature, uint32_t now_ms)
                 s_current_person_id = id;
                 strlcpy(s_current_identity_name, reid_gallery_get_name(id),
                         sizeof(s_current_identity_name));
+                s_current_reid_similarity_valid = false;
+                s_current_reid_similarity = 0.0f;
             } else {
                 speak_text("注册失败，请重试。");
             }
@@ -959,21 +1317,64 @@ static void reid_match_and_set_identity(const float *feature, uint32_t now_ms)
     }
 
     float match_sim = 0.0f;
-    int person_id = reid_gallery_query(feature, REID_MATCH_THRESHOLD, &match_sim);
-    if (person_id > 0) {
+    int raw_id = reid_gallery_query(feature, REID_MATCH_THRESHOLD, &match_sim);
+    if (raw_id > 0) {
         /* Re-run update so that the matched template gets EMA-updated. */
         reid_gallery_update(feature, now_ms, &match_sim);
-        s_current_person_id = person_id;
-        strlcpy(s_current_identity_name, reid_gallery_get_name(person_id),
+
+        /* Matched a registered person: show immediately, skip voting.
+         * This makes the UI responsive to successful recognition. */
+        s_current_person_id = raw_id;
+        strlcpy(s_current_identity_name, reid_gallery_get_name(raw_id),
                 sizeof(s_current_identity_name));
+        s_current_reid_similarity = match_sim;
+        s_current_reid_similarity_valid = true;
+        s_confirmed_identity = raw_id;
+
+        /* Reset voting history to this identity so it persists through
+         * subsequent frames. */
+        for (int i = 0; i < REID_IDENTITY_HISTORY_LEN; i++) {
+            s_reid_history[i] = raw_id;
+        }
+        s_reid_history_idx = 0;
+
         ESP_LOGI(TAG, "Re-ID matched %s (id=%d), sim=%.4f",
-                 s_current_identity_name, person_id, match_sim);
-    } else {
-        /* Unknown person detected but do not auto-register a new gallery entry;
-         * this prevents the gallery from filling with transient strangers. */
+                 s_current_identity_name, raw_id, match_sim);
+        return;
+    } else if (raw_id < 0) {
+        /* Query returned no reliable match. Treat as unknown for this frame. */
+        raw_id = -1;
+    }
+
+    int voted_id = reid_identity_vote(raw_id);
+    if (voted_id == -2) {
+        /* Not enough consecutive consensus: keep the previously confirmed
+         * identity without logging every frame. */
+        return;
+    }
+
+    s_confirmed_identity = voted_id;
+
+    if (voted_id > 0) {
+        s_current_person_id = voted_id;
+        strlcpy(s_current_identity_name, reid_gallery_get_name(voted_id),
+                sizeof(s_current_identity_name));
+        s_current_reid_similarity = match_sim;
+        s_current_reid_similarity_valid = true;
+        ESP_LOGI(TAG, "Re-ID matched %s (id=%d), sim=%.4f",
+                 s_current_identity_name, voted_id, match_sim);
+    } else if (voted_id == 0) {
+        /* Confident stranger after multi-frame consensus. */
         s_current_person_id = 0;
         strlcpy(s_current_identity_name, "陌生人", sizeof(s_current_identity_name));
+        s_current_reid_similarity_valid = false;
+        s_current_reid_similarity = 0.0f;
         ESP_LOGI(TAG, "Re-ID unknown person, sim=%.4f", match_sim);
+    } else {
+        s_current_person_id = -1;
+        s_current_identity_name[0] = '\0';
+        s_current_reid_similarity_valid = false;
+        s_current_reid_similarity = 0.0f;
     }
 }
 
@@ -999,11 +1400,19 @@ static void on_detect_frame(bool detected, const uint8_t *rgb565, int w, int h,
     uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 
     if (!detected) {
-        /* No person this frame: show 未识别, following the detect result. */
+        handle_family_owner_observation(FAMILY_OWNER_OBSERVATION_NO_PERSON,
+                                        -1, false, 0.0f, now_ms);
+        /* No person this frame: clear identity label and reset the multi-frame
+         * Re-ID history so the next person starts fresh. */
         if (s_detected_person_now || s_current_person_id != -1) {
             s_detected_person_now = false;
             s_current_person_id = -1;
             s_current_identity_name[0] = '\0';
+            s_current_reid_similarity_valid = false;
+            s_current_reid_similarity = 0.0f;
+            s_confirmed_identity = -1;
+            memset(s_reid_history, -1, sizeof(s_reid_history));
+            s_reid_history_idx = 0;
             update_focus_ui();
             ui_manager_update(&s_ui_model);
         }
@@ -1024,25 +1433,28 @@ static void on_detect_frame(bool detected, const uint8_t *rgb565, int w, int h,
         return;
     }
 
-    /* detected=true: run Re-ID and update the UI identity on every frame. */
+    /* detected=true: run Re-ID and update the UI identity on every frame.
+     * The multi-frame consistency voter inside reid_match_and_set_identity
+     * decides when to switch identity, suppressing single-frame jitters. */
     float feature[REID_FEATURE_DIM];
     if (!reid_extract_from_frame(rgb565, w, h, x1, y1, x2, y2, feature)) {
         return;
     }
 
+    /* Query once for family owner tracking (never runs ReID itself). */
     float sim = 0.0f;
     int qid = reid_gallery_query(feature, REID_MATCH_THRESHOLD, &sim);
-
     if (qid > 0) {
-        /* Matched a registered identity: update identity + template every frame. */
-        s_detected_person_now = true;
-        reid_match_and_set_identity(feature, now_ms);
+        handle_family_owner_observation(FAMILY_OWNER_OBSERVATION_KNOWN,
+                                        qid, true, sim, now_ms);
     } else {
-        /* Detected a shape but no registered match: show 未识别. */
-        s_detected_person_now = false;
-        s_current_person_id = -1;
-        s_current_identity_name[0] = '\0';
+        handle_family_owner_observation(FAMILY_OWNER_OBSERVATION_UNKNOWN,
+                                        -1, false, 0.0f, now_ms);
     }
+
+    /* Unified identity update with multi-frame consistency voting. */
+    s_detected_person_now = true;
+    reid_match_and_set_identity(feature, now_ms);
     update_focus_ui();
     ui_manager_update(&s_ui_model);  /* follow the detect result every frame */
 }
@@ -1078,9 +1490,21 @@ static void on_human_left(uint32_t duration_ms)
 {
     ESP_LOGI(TAG, "human left callback, presence_duration=%" PRIu32 " ms", duration_ms);
 
-    focus_stop(true);
+    uint32_t left_tick_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    family_event_t end_event;
+    family_session_guard_t session_guard;
+    bool absence_started = family_events_get_session_guard(&session_guard) &&
+        family_events_end_and_begin_absence(
+            &session_guard, left_tick_ms, family_timestamp_now(),
+            FAMILY_ABSENCE_SOURCE_HUMAN_LEFT, &end_event);
+    ESP_LOGI(TAG, "atomic absence transition=%d", absence_started);
+    if (absence_started) {
+        finish_focus_end_event(&end_event, true);
+    }
     s_current_person_id = -1;
     s_current_identity_name[0] = '\0';
+    s_current_reid_similarity_valid = false;
+    s_current_reid_similarity = 0.0f;
     s_ui_model.seat_state = "离座";
     s_ui_model.event_duration_seconds = duration_ms / 1000;
     update_focus_ui();
@@ -1106,6 +1530,9 @@ static void on_human_present(void)
 {
     ESP_LOGI(TAG, "human present callback");
 
+    /* This edge remains a local UI entry only. Family return confirmation is
+     * counted exclusively by subsequent on_detect_frame qid/sim observations. */
+    family_events_mark_human_present();
     s_ui_model.seat_state = "在座";
     run_reid_and_update_ui();
     ui_manager_update(&s_ui_model);
@@ -1122,9 +1549,8 @@ static void on_human_left_reminder(uint32_t absent_ms)
         return;
     }
     ESP_LOGI(TAG, "human left reminder, absent_ms=%" PRIu32, absent_ms);
-    int conf = (int)(s_last_detect_score * 100.0f + 0.5f);
-    cloud_sync_alert(CLOUD_SYNC_ALERT_LEAVE_SEAT, conf,
-                     "离开座位超过一分钟");
+    /* Family LONG_ABSENCE is generated by family_events_maintain(), even when
+     * this legacy local reminder is suppressed by monitor mode. */
     speak_text("你已经离开座位一分钟了，回来我们继续学习吧。");
 }
 #if CONFIG_WAKE_WORD_ENABLED
@@ -1285,14 +1711,18 @@ static void on_pir_motion_detected(void)
         return;
     }
 
+    xSemaphoreTake(s_monitor_mutex, portMAX_DELAY);
+    int monitor_whitelist_id = s_monitor_whitelist_id;
+    xSemaphoreGive(s_monitor_mutex);
+
     /* Re-ID whitelist check: if the moving person is the registered user,
      * do not bother the VLM/TTS path. */
-    if (s_monitor_whitelist_id > 0 && human_is_present()) {
+    if (monitor_whitelist_id > 0 && human_is_present()) {
         float feature[REID_FEATURE_DIM];
         if (extract_reid_feature(feature)) {
             float sim = 0.0f;
             int id = reid_gallery_query(feature, REID_MATCH_THRESHOLD, &sim);
-            if (id == s_monitor_whitelist_id) {
+            if (id == monitor_whitelist_id) {
                 ESP_LOGI(TAG, "monitor: whitelist identity %s detected, skip VLM",
                          reid_gallery_get_name(id));
                 heap_caps_free(cur_jpeg);
@@ -1357,7 +1787,28 @@ static void on_pir_motion_detected(void)
 
     ESP_LOGI(TAG, "monitor: change detected: %s", vlm_result.text);
 
-    cloud_sync_alert(CLOUD_SYNC_ALERT_GUARD, 90, vlm_result.text);
+    int guard_person_id = -1;
+    char guard_person_name[REID_MAX_NAME_LEN + 1] = {0};
+    if (monitor_whitelist_id > 0) {
+        const reid_person_t *whitelist_person =
+            reid_gallery_find_by_id(monitor_whitelist_id);
+        if (whitelist_person != NULL) {
+            guard_person_id = whitelist_person->person_id;
+            strlcpy(guard_person_name, whitelist_person->name,
+                    sizeof(guard_person_name));
+        }
+    }
+    family_event_t guard_event;
+    if (family_events_make_guard_alert(guard_person_id, guard_person_name,
+                                       family_timestamp_now(),
+                                       false, 0.0f,
+                                       vlm_result.text, &guard_event)) {
+        bool queued = cloud_sync_publish(&guard_event);
+        ESP_LOGI(TAG, "guard family event emitted (person_id=%d, queued=%d)",
+                 guard_event.person_id, queued);
+    } else {
+        ESP_LOGW(TAG, "failed to construct guard family event");
+    }
 
     /* Update reference frame to current to avoid repeated alerts. */
     xSemaphoreTake(s_monitor_mutex, portMAX_DELAY);
@@ -1498,10 +1949,17 @@ static esp_err_t isp_apply_color_correction(isp_proc_handle_t isp_proc)
 void app_main(void)
 {
     esp_err_t ret = ESP_FAIL;
+#if CONFIG_FAMILY_LINK_ENABLE
+    static bool s_family_audio_ready = false;
+#endif
 
     s_cam_capture_mutex = xSemaphoreCreateMutex();
     s_reid_mutex = xSemaphoreCreateMutex();
     monitor_init();
+    esp_err_t family_ret = family_events_init();
+    if (family_ret != ESP_OK) {
+        ESP_LOGE(TAG, "family events init failed: %s", esp_err_to_name(family_ret));
+    }
     cloud_api_init();
     tts_worker_start();
 
@@ -1510,9 +1968,8 @@ void app_main(void)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "wifi connect failed, continuing without network");
     } else {
-        /* cloud_sync temporarily disabled to reduce memory pressure while
-         * debugging TTS playback stability. */
-        // cloud_sync_init();
+        /* cloud_sync enabled for family event reporting. */
+        cloud_sync_init();
         http_test_request();
     }
 
@@ -1615,6 +2072,9 @@ void app_main(void)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "audio init failed, continuing without audio");
     } else {
+#if CONFIG_FAMILY_LINK_ENABLE
+        s_family_audio_ready = true;
+#endif
 #if CONFIG_AUDIO_ENABLE_LOOPBACK_TEST
         ESP_LOGI(TAG, "starting audio loopback test task");
         xTaskCreate(audio_loopback_test, "audio_loopback", 8192, NULL, 5, NULL);
@@ -1632,6 +2092,15 @@ void app_main(void)
         xTaskCreate(audio_record_test, "audio_record_test", 8192, NULL, 5, NULL);
 #endif
     }
+
+#if CONFIG_FAMILY_LINK_ENABLE
+    esp_err_t family_link_ret = family_link_start(
+        family_voice_playback, &s_family_audio_ready);
+    if (family_link_ret != ESP_OK) {
+        ESP_LOGE(TAG, "family link start failed: %s",
+                 esp_err_to_name(family_link_ret));
+    }
+#endif
 
     //---------------PIR Sensor Init------------------//
 #if CONFIG_PIR_SENSOR_ENABLED

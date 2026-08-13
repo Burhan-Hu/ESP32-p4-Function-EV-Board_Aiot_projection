@@ -2434,11 +2434,11 @@ CONFIG_CLOUD_API_VOLCANO_TTS_VOLUME=80
 # end of Cloud API Configuration
 
 #
-# Cloud Sync (local cloud server)
+# Cloud Sync
 #
-CONFIG_CLOUD_SYNC_SERVER_URL="http://10.154.248.32:5000"
+CONFIG_CLOUD_SYNC_SERVER_URL="http://10.129.51.32:5000"
 CONFIG_CLOUD_SYNC_NTP_SERVER="ntp.aliyun.com"
-# end of Cloud Sync (local cloud server)
+# end of Cloud Sync
 
 #
 # ESP-DL Configuration
@@ -2464,6 +2464,19 @@ CONFIG_PIX_CVT_YUV_TO_HSV_SUPPORT=y
 CONFIG_PIX_CVT_YUV_TO_YUV_SUPPORT=y
 # end of Vision/Image: Pixel Convert Support
 # end of ESP-DL Configuration
+
+#
+# Family Link (guardian short voice downlink)
+#
+CONFIG_FAMILY_LINK_ENABLE=y
+CONFIG_FAMILY_LINK_SERVER_URL="http://10.129.51.32:5000"
+CONFIG_FAMILY_LINK_POLL_INTERVAL_MS=2000
+CONFIG_FAMILY_LINK_HEARTBEAT_INTERVAL_MS=10000
+CONFIG_FAMILY_LINK_HTTP_TIMEOUT_MS=10000
+CONFIG_FAMILY_LINK_RETRY_INITIAL_MS=1000
+CONFIG_FAMILY_LINK_RETRY_MAX_MS=10000
+CONFIG_FAMILY_LINK_TASK_STACK_SIZE=8192
+# end of Family Link (guardian short voice downlink)
 
 #
 # Human Detection Configuration
